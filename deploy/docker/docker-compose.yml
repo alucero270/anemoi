@@ -1,0 +1,9 @@
+services:
+  anemoi-router:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../config/appsettings.example.json:/app/appsettings.json:ro
