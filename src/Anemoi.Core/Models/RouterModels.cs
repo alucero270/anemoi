@@ -60,6 +60,7 @@ public sealed record BackendDescriptor(
     Uri BaseUrl,
     TimeSpan Timeout,
     bool Enabled,
+    bool AllowInsecureTls,
     IReadOnlyDictionary<string, string> Metadata);
 
 public sealed record BackendHealthResult(

@@ -113,6 +113,7 @@ internal static class TestConfiguration
             values[$"Router:Backends:{i}:BaseUrl"] = backend.BaseUrl;
             values[$"Router:Backends:{i}:TimeoutSeconds"] = backend.TimeoutSeconds.ToString();
             values[$"Router:Backends:{i}:Enabled"] = backend.Enabled.ToString();
+            values[$"Router:Backends:{i}:AllowInsecureTls"] = backend.AllowInsecureTls.ToString();
         }
 
         for (var i = 0; i < options.Profiles.Count; i++)
