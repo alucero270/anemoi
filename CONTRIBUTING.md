@@ -135,6 +135,20 @@ Rules:
 - Merge via Pull Request
 - Squash only if commits are noisy
 - Do not push directly to main
+- The repository enforces this locally through versioned git hooks and in CI
+
+## Local Hook Setup
+
+Run this once after cloning:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This enables the versioned local hooks that:
+- reject commits on `main` or `master`
+- require `issue/<number>-short-description` branch names
+- validate commit messages against the documented format
 
 ---
 
