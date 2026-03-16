@@ -16,13 +16,13 @@ jobs:
           fetch-depth: 0
       - name: Validate PR branch name
         if: github.event_name == 'pull_request'
-        run: bash ./scripts/validate-branch-name.sh "${{ github.head_ref }}"
+        run: bash ./.github/scripts/validate-branch-name.sh "${{ github.head_ref }}"
       - name: Validate push branch name
         if: github.event_name == 'push'
         run: |
           branch="${GITHUB_REF#refs/heads/}"
           if [ "$branch" != "main" ]; then
-            bash ./scripts/validate-branch-name.sh "$branch"
+            bash ./.github/scripts/validate-branch-name.sh "$branch"
           fi
       - name: Validate commit messages in pull request
         if: github.event_name == 'pull_request'
@@ -30,7 +30,7 @@ jobs:
           git rev-list --reverse "${{ github.event.pull_request.base.sha }}..${{ github.sha }}" |
           while read -r commit; do
             git log --format=%B -n 1 "$commit" > .git/COMMIT_EDITMSG
-            bash ./scripts/validate-commit-message.sh .git/COMMIT_EDITMSG
+            bash ./.github/scripts/validate-commit-message.sh .git/COMMIT_EDITMSG
           done
       - name: Validate commit messages in push
         if: github.event_name == 'push'
@@ -43,7 +43,7 @@ jobs:
           while read -r commit; do
             [ -n "$commit" ] || continue
             git log --format=%B -n 1 "$commit" > .git/COMMIT_EDITMSG
-            bash ./scripts/validate-commit-message.sh .git/COMMIT_EDITMSG
+            bash ./.github/scripts/validate-commit-message.sh .git/COMMIT_EDITMSG
           done
 
   build-test:
