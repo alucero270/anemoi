@@ -11,6 +11,7 @@ public static class OllamaChatMapper
         {
             Model = routeDecision.UpstreamModel,
             Stream = request.Stream,
+            Think = false,
             Messages = request.Messages
                 .Select(static message => new OllamaMessage { Role = message.Role, Content = message.Content })
                 .ToArray(),
