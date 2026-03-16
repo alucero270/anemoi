@@ -35,13 +35,13 @@ jobs:
       - name: Validate commit messages in push
         if: github.event_name == 'push'
         run: |
-          if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
-            range="${{ github.sha }}"
-          else
-            range="${{ github.event.before }}..${{ github.sha }}"
+          commits="$(jq -r '.commits[].id' "$GITHUB_EVENT_PATH")"
+          if [ -z "$commits" ]; then
+            commits="${GITHUB_SHA}"
           fi
-          git rev-list --reverse "$range" |
+          printf '%s\n' "$commits" |
           while read -r commit; do
+            [ -n "$commit" ] || continue
             git log --format=%B -n 1 "$commit" > .git/COMMIT_EDITMSG
             bash ./scripts/validate-commit-message.sh .git/COMMIT_EDITMSG
           done
