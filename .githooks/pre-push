@@ -2,4 +2,4 @@
 set -eu
 
 repo_root="$(git rev-parse --show-toplevel)"
-"$repo_root/scripts/validate-branch-name.sh"
+sh "$repo_root/scripts/validate-branch-name.sh"
