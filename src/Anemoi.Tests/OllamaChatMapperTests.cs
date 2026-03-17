@@ -26,6 +26,7 @@ public sealed class OllamaChatMapperTests
         var payload = OllamaChatMapper.MapRequest(request, Decision);
 
         Assert.Equal("llama3.1:8b", payload.Model);
+        Assert.False(payload.Think);
         Assert.Equal(0.7, payload.Options!.Temperature);
         Assert.Equal("Hello", payload.Messages.Single().Content);
     }

@@ -135,6 +135,8 @@ Rules:
 - Merge via Pull Request
 - Squash only if commits are noisy
 - Do not push directly to main
+- The repository enforces this in CI
+- Local hooks are optional and not assumed, because Git does not clone client-side hooks by default
 
 ---
 
