@@ -6,7 +6,11 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddOllamaBackendSupport(this IServiceCollection services)
     {
-        services.AddHttpClient<Clients.OllamaHttpClient>();
+        services.AddHttpClient<Clients.OllamaHttpClient>(static client =>
+        {
+            client.Timeout = Timeout.InfiniteTimeSpan;
+        });
+
         return services;
     }
 }
