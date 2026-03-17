@@ -6,7 +6,11 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddLlamaCppBackendSupport(this IServiceCollection services)
     {
-        services.AddHttpClient<Clients.LlamaCppHttpClient>();
+        services.AddHttpClient<Clients.LlamaCppHttpClient>(static client =>
+        {
+            client.Timeout = Timeout.InfiniteTimeSpan;
+        });
+
         return services;
     }
 }
