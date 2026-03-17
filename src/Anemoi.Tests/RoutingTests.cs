@@ -65,7 +65,7 @@ public sealed class RoutingTests
     {
         var backend = new Mock<IChatBackend>();
         backend.SetupGet(static b => b.Descriptor)
-            .Returns(new BackendDescriptor("ollama-main", BackendType.Ollama, new Uri("http://ollama.test"), TimeSpan.FromSeconds(30), true, new Dictionary<string, string>()));
+            .Returns(new BackendDescriptor("ollama-main", BackendType.Ollama, new Uri("http://ollama.test"), TimeSpan.FromSeconds(30), true, false, new Dictionary<string, string>()));
 
         var registry = new BackendRegistry([ backend.Object ], NullLogger<BackendRegistry>.Instance);
 

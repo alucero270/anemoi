@@ -36,6 +36,8 @@ public sealed class BackendOptions
 
     public bool Enabled { get; set; } = true;
 
+    public bool AllowInsecureTls { get; set; }
+
     public Dictionary<string, string> Metadata { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 

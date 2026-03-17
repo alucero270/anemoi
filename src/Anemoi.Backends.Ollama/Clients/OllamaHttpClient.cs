@@ -1,4 +1,7 @@
 using System.Net.Http.Headers;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Collections.Concurrent;
 using Anemoi.Core.Models;
 
 namespace Anemoi.Backends.Ollama.Clients;
@@ -6,6 +9,7 @@ namespace Anemoi.Backends.Ollama.Clients;
 public sealed class OllamaHttpClient
 {
     private readonly HttpClient _httpClient;
+    private readonly ConcurrentDictionary<string, HttpClient> _insecureClients = new(StringComparer.OrdinalIgnoreCase);
 
     public OllamaHttpClient(HttpClient httpClient)
     {
@@ -26,6 +30,26 @@ public sealed class OllamaHttpClient
         using var timeoutCts = new CancellationTokenSource(backend.Timeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
 
-        return await _httpClient.SendAsync(request, completionOption, linkedCts.Token);
+        return await GetHttpClient(backend).SendAsync(request, completionOption, linkedCts.Token);
+    }
+
+    private HttpClient GetHttpClient(BackendDescriptor backend)
+    {
+        if (!backend.AllowInsecureTls)
+        {
+            return _httpClient;
+        }
+
+        return _insecureClients.GetOrAdd(backend.BaseUrl.Authority, _ =>
+        {
+            var handler = new HttpClientHandler
+            {
+                ServerCertificateCustomValidationCallback = static (_, _, _, _) => true
+            };
+
+            var insecureClient = new HttpClient(handler, disposeHandler: true);
+            insecureClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            return insecureClient;
+        });
     }
 }
