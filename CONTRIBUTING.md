@@ -1,240 +1,182 @@
-# Contributing to Anemoi
+# Contributing To Anemoi
 
-Anemoi follows strict commit conventions and disciplined change control to keep the
-project readable, maintainable, and portfolio-grade.
+Anemoi is intentionally narrow at the core. Contributions should strengthen the
+local inference governance loop rather than broaden the project into a provider
+gateway, runtime, agent framework, or application platform.
 
-Codex may assist with implementation, but all changes must follow these conventions.
+## Current Repository State
 
----
+As of 2026-05-24, this checkout contains both:
 
-# Git Commit Guidelines
+- an active Rust workspace under `crates/anemoi-*`
+- legacy `.NET`/C# files under `src/Anemoi.*` plus `Anemoi.sln`
 
-Each commit message consists of:
-- Header (required)
-- Body (strongly encouraged)
-- Footer (optional)
+Treat the legacy .NET surface as `Needs validation`. Do not delete, rename, or
+migrate it unless the task explicitly scopes that work.
 
-No line may exceed 100 characters.
+## Ground Rules
 
-## Commit Message Format
+- Preserve the boundary: Anemoi decides; runtimes execute.
+- Keep runtime-specific protocol details out of `anemoi-core`.
+- Keep policy scoring in `anemoi-policy`.
+- Keep adapters in `anemoi-runtime`.
+- Keep telemetry persistence in `anemoi-telemetry`.
+- Keep API and CLI surfaces thin.
+- Do not introduce provider-gateway behavior before residency governance works.
+- Do not add cloud execution as a default path.
+- Do not commit secrets, private prompts, runtime tokens, or host-only paths.
+- Use repository evidence over assumptions.
+- Mark unresolved runtime, migration, or policy questions as `Needs validation`.
 
-type(scope): subject
+## Development Priorities
 
-Body (optional but strongly encouraged)
+Work should serve the first complete governance loop:
 
-Footer (optional)
+```text
+load config
+inspect runtimes
+normalize residency
+receive request
+generate candidates
+score candidates
+choose reuse / load / deny / stage
+record decision
+explain decision
+```
 
-The header is mandatory.
-The scope is required for this project.
+When choosing between feature breadth and policy clarity, prefer policy clarity.
 
-## Revert
+## Architecture Boundaries
 
-If reverting a commit:
-
-revert: <original header>
-
-Body must include:
-This reverts commit <hash>.
-
-## Type
-
-Must be one of:
-* feat:     A new feature
-* fix:      A bug fix
-* refactor: Code change without feature or bug fix
-* perf:     Performance improvement
-* test:     Add or update tests
-* docs:     Documentation-only changes
-* style:    Formatting only (no logic changes)
-* chore:    Tooling, build, or dependency changes
-* ci:       CI/CD workflow changes
-
-## Scope
-
-Scope describes the subsystem affected.
-
-Approved scopes for Anemoi:
-* core       Canonical models, interfaces, orchestration primitives
-* routing    Alias, profile, rule, and route decision logic
-* api        ASP.NET Core controllers, middleware, northbound API behavior
-* backends   Shared backend integration work spanning multiple adapters
-* ollama     Ollama adapter implementation
-* llamacpp   llama.cpp adapter implementation
-* config     Configuration binding, validation, options, appsettings
-* health     Health reporting and diagnostics endpoints
-* models     `/v1/models` behavior and model metadata exposure
-* logging    Structured logging, trace context, observability plumbing
-* tests      Automated tests and test infrastructure
-* docs       Documentation updates
-* repo       Repository structure changes
-* ops        Docker, compose, deployment, and environment operations
-* ci         CI workflow changes
-
-Use lowercase.
-
-Examples:
-* feat(api): add streaming chat completion controller
-* feat(routing): add capability-aware route decision metadata
-* fix(ollama): normalize done_reason in streaming adapter
-* chore(ops): add compose override for private ollama host
-
-## Subject Rules
-
-The subject must:
-- Use imperative present tense ("add", not "added")
-- Not capitalize the first letter
-- Not end with a period
-- Be concise and descriptive
-
-Correct:
-+ add streaming fallback guard
-+ enforce startup config validation
-
-Incorrect:
-+ Added startup validation.
-
-## Body
-
-Use imperative tense.
-Explain:
-- What changed
-- Why it changed
-- How it differs from previous behavior
-
-Keep lines under 100 characters.
-
-Example:
-Add request-scoped route logging to chat execution.
-
-Previously the router logged success and failure without consistently attaching the
-selected alias, backend, or request identity. Add a scoped log context so diagnostics
-can reconstruct the execution path.
-
-Closes #12
-
-## Footer
-
-Used for:
-- Referencing issues: "Closes #12", "Refs #14"
-- Breaking changes: must begin with "BREAKING CHANGE:"
-
----
-
-# Branching Strategy
-
-- One branch per issue
-- Branch name format:
-  issue/<number>-short-description
-
-Examples:
-issue/3-ollama-live-validation
-issue/7-role-routing-foundation
-issue/12-streaming-fix
+| Crate | Responsibility |
+|---|---|
+| `anemoi-core` | Domain types, config, residency states, decisions, explanations. |
+| `anemoi-runtime` | Runtime adapter trait, mock adapter, and runtime inspection adapters. |
+| `anemoi-policy` | Deterministic scheduler, scoring, and continuity fallback behavior. |
+| `anemoi-telemetry` | Recent in-memory decisions and optional append-only JSONL logging. |
+| `anemoi-daemon` | Axum local control-plane API. |
+| `anemoi-cli` | Operator commands such as `status`, `decide`, `explain`, and `residents`. |
+| `anemoi-mcp` | Minimum MCP adapter over existing core, daemon, and telemetry services. |
 
 Rules:
-- Merge via Pull Request
-- Squash only if commits are noisy
-- Do not push directly to main
-- The repository enforces this in CI
-- Local hooks are optional and not assumed, because Git does not clone client-side hooks by default
 
----
+- Domain crates should not perform network I/O.
+- Runtime adapters should not make policy decisions.
+- Phase one has no required database. SQLite and database-backed analytics are
+  future work.
+- CLI commands should orchestrate the daemon/core services rather than
+  reimplementing scheduler logic.
+- API handlers should expose decisions, not hide them behind opaque routing.
+- MCP handlers should adapt to existing services and must not duplicate
+  scheduler, runtime, or telemetry logic.
 
-# Code Style
+## Testing Policy
 
-## .NET / C#
+Policy tests should come before runtime integration tests.
 
-- Target `.NET 10`
-- Nullable reference types stay enabled
-- Use `async` end-to-end for I/O paths
-- Accept and propagate `CancellationToken` on backend and API flows
-- Use controllers, not Minimal APIs, unless the project direction changes explicitly
-- Use `System.Text.Json`
-- Use strongly typed options for router configuration
-- Use `IHttpClientFactory` with typed clients for outbound backend calls
-- Use `ILogger<T>` in application code and Serilog as the configured provider
+Use `docs/test_roadmap.md` as the prompt-aligned gate list. Later scaffolding
+can exist, but a prompt is not accepted until its named tests and earlier
+invariants pass.
 
-## Architecture Rules
+Required early tests:
 
-- Keep canonical router models in `Anemoi.Core`
-- Keep backend-specific DTOs inside adapter projects only
-- Do not leak Ollama or llama.cpp payload types into `Anemoi.Api` or `Anemoi.Core`
-- Keep `Program.cs` focused on host setup, DI, middleware, controllers, and health
-- Prefer explicit route decisions and structured state over hidden conversational logic
-- Avoid speculative abstractions for later phases until the current phase is stable
+- `avoids_cold_large_model_when_small_worker_is_hot`
+- config parsing succeeds for `config/anemoi.example.yaml`
+- unknown domains are rejected deterministically
+- unavailable runtimes produce rejected options
+- hot residents score higher than cold candidates under interactive budgets
+- memory pressure affects scoring
+- explanations include reasons for the selected path
+- decision logs default to memory and can optionally append JSONL
 
-## Testing
+Use single-purpose tests by default. End-to-end tests are useful only when they
+prove the whole governance loop.
 
-- Use `xUnit` for automated tests
-- Use `Moq` where mocking is the simplest option
-- Add or update tests for routing, adapter behavior, and API behavior when relevant
-- Run:
-  - `dotnet build Anemoi.sln`
-  - `dotnet test Anemoi.sln`
+## Validation
 
-## Naming
+Before handoff for Rust changes, run:
 
-- Namespaces: `Anemoi.*`
-- Classes, records, enums: PascalCase
-- Methods, locals, parameters, fields: camelCase
-- Constants: PascalCase or UPPER_SNAKE_CASE only when clearly appropriate
-- Config sections and JSON fields should remain stable and explicit
+```powershell
+cargo fmt --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
 
-## Logging
+If the task touches only documentation, run the strongest practical text checks
+and inspect the changed Markdown.
 
-- Use structured logs only
-- Include request identity and routing context where practical
-- Do not log secrets, tokens, or private prompts unnecessarily
-- Avoid logging raw transcripts by default unless debugging specifically requires it
+If Rust tooling is unavailable, report it explicitly.
 
-## Config
+## Commit Guidelines
 
-- Runtime config is JSON-based (`appsettings.json`, environment overrides, or mounted files)
-- Do not hardcode environment-specific paths or private host addresses in production code
-- Prefer environment variables or deployment-specific config for secrets and host overrides
-- Validate critical router configuration at startup
+Use Conventional Commits:
 
----
+```text
+type(scope): subject
+```
 
-# Security Basics
+Allowed types:
 
-- No secrets in git
-- Use environment variables or deployment config for credentials and tokens
-- Keep strict timeouts on outbound HTTP calls to local or remote backends
-- Treat future cloud execution as policy-controlled and opt-in, not default
-- Keep private or sensitive work local unless policy explicitly allows otherwise
+- `feat`
+- `fix`
+- `refactor`
+- `perf`
+- `test`
+- `docs`
+- `style`
+- `chore`
+- `ci`
 
----
+Suggested scopes:
 
-# Pull Requests
+- `core`
+- `runtime`
+- `policy`
+- `telemetry`
+- `daemon`
+- `cli`
+- `config`
+- `docs`
+- `repo`
+- `legacy`
 
-- Describe the user-visible or operator-visible impact
-- Note routing, backend, or configuration changes explicitly
-- Reference the issue and milestone being advanced
-- Include test coverage changes when relevant
-- Call out any intentionally deferred work or known gaps
+Examples:
 
----
+```text
+feat(policy): stage large model behind hot worker
+fix(runtime): normalize ollama resident model names
+docs(repo): document legacy dotnet surface
+```
 
-# Example Commits
+## Pull Requests
 
-feat(api): add openai-compatible streaming chat endpoint
+PRs should include:
 
-Add controller support for streamed chat completion responses.
-Normalize router stream events into OpenAI-style SSE chunks.
+- the behavior changed
+- the policy or runtime boundary affected
+- tests added or updated
+- validation run
+- known limitations or `Needs validation` items
 
-Closes #5
+Use `Closes #123` only when the PR fully satisfies the issue. Use `References
+#123` for partial or related work.
 
-fix(ollama): handle malformed upstream response payloads
+## Stop Conditions
 
-Previously malformed Ollama JSON could surface as an unclassified failure.
-Map the error to an upstream protocol exception for clearer diagnostics.
+Stop and ask for direction when:
 
-Closes #8
+- a task would turn Anemoi into an inference runtime
+- a task would introduce provider-gateway behavior before core policy works
+- a change requires deleting or migrating legacy .NET files without explicit
+  scope
+- runtime behavior is ambiguous and would change product semantics
+- validation fails outside the task scope
+- live runtime changes would be required but were not explicitly requested
 
-chore(ops): add docker compose starter config
+## Security
 
-Add a simple compose file and example appsettings mount for local deployment.
-Document the expected host mapping for backend services.
-
-Refs #3
+- No secrets in Git.
+- Keep local-first behavior as the default.
+- Bind local services to loopback unless exposure is explicitly approved.
+- Treat cloud execution as future, policy-controlled, and opt-in.
+- Avoid logging raw prompts or transcripts by default.

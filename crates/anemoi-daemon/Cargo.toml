@@ -1,0 +1,23 @@
+[package]
+name = "anemoi-daemon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anemoi-core.workspace = true
+anemoi-policy.workspace = true
+anemoi-runtime.workspace = true
+anemoi-telemetry.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
