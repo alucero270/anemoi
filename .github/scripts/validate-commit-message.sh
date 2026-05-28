@@ -3,7 +3,7 @@ set -eu
 
 message_file="${1:?commit message file is required}"
 
-allowed_scopes='core|routing|api|backends|ollama|llamacpp|config|health|models|logging|tests|docs|repo|ops|ci'
+allowed_scopes='core|runtime|policy|telemetry|daemon|cli|mcp|config|docs|repo|ci'
 allowed_types='feat|fix|refactor|perf|test|docs|style|chore|ci'
 
 first_line="$(sed -n '1p' "$message_file")"
@@ -25,6 +25,8 @@ if printf '%s' "$first_line" | grep -Eq '^revert: .+'; then
 else
   if ! printf '%s' "$first_line" | grep -Eq "^(${allowed_types})\\((${allowed_scopes})\\): .+"; then
     echo "Commit header must match type(scope): subject using an approved type and scope." >&2
+    echo "Allowed types: ${allowed_types}" >&2
+    echo "Allowed scopes: ${allowed_scopes}" >&2
     exit 1
   fi
 

@@ -48,15 +48,18 @@ jobs:
 
   build-test:
     needs: commit-policy
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          dotnet-version: 10.0.x
-      - name: Restore
-        run: dotnet restore Anemoi.sln
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
       - name: Build
-        run: dotnet build Anemoi.sln --no-restore --configuration Release
+        run: cargo build --workspace
       - name: Test
-        run: dotnet test Anemoi.sln --no-build --configuration Release
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
