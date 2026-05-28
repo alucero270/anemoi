@@ -31,14 +31,6 @@ else
   fi
 
   subject="$(printf '%s' "$first_line" | sed -E "s/^(${allowed_types})\\((${allowed_scopes})\\): //")"
-  first_subject_char="$(printf '%s' "$subject" | cut -c1)"
-
-  case "$first_subject_char" in
-    [A-Z])
-      echo "Commit subject must not start with a capital letter." >&2
-      exit 1
-      ;;
-  esac
 
   case "$subject" in
     *.)
