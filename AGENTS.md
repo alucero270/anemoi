@@ -293,6 +293,76 @@ Do not:
 
 ---
 
+## 16. Prompt Completion Discipline
+
+### Promotion Rule
+
+A prompt is not complete until all of the following are true:
+
+- The procedure or design document exists.
+- The required test names declared in `docs/build_prompts/` exist by exact
+  name in the crate test output.
+- `cargo test --workspace` passes with those tests present.
+- Any safety gate, opt-in flag, or permission boundary described in the
+  prompt is enforced by code, not only by documentation.
+- `docs/test_roadmap.md` status is updated to `Passing` in the same commit.
+- The work is committed. Uncommitted work does not exist.
+
+Documentation alone does not close a prompt.
+
+### No Skipped Prompts
+
+Do not begin prompt N+1 while prompt N is incomplete. Do not leave gaps in
+the prompt sequence. If a prompt is deferred, mark it `Deferred` in the
+roadmap with a reason.
+
+### Required Test Names Are Declared Upfront
+
+Each build prompt in `docs/build_prompts/` must list exact test function
+names under `## Required Tests` before implementation begins. Those exact
+names must appear in `cargo test --workspace` output to pass. Renaming or
+omitting a required test name is a promotion failure.
+
+### Commit Cadence
+
+Each prompt lands as one or more commits. Do not start a new prompt while
+a prior prompt has uncommitted scaffolding. Use `git status` to confirm
+before starting.
+
+### Roadmap Is Source of Truth
+
+`docs/test_roadmap.md` is the canonical record of what is done and what is
+pending. Updating its status is part of the prompt's commit — not a
+separate follow-up. A prompt whose tests pass but whose roadmap still says
+`Pending` is not promoted.
+
+### Verification Before Claiming Done
+
+Before marking a prompt `Passing`, run:
+
+```powershell
+cargo fmt --check
+cargo test --workspace
+```
+
+Confirm the prompt's required test names appear by name in the output.
+`cargo test` passing is necessary but not sufficient — the named tests must
+be present.
+
+### Safety Gates Must Be Code-Enforced
+
+If a prompt describes a permission boundary, opt-in flag, or approval gate
+(example: `ANEMOI_ENABLE_LIVE_EXECUTE=1`), that gate must be enforced in
+daemon or CLI code. A gate that exists only in documentation provides no
+protection.
+
+### Branch Discipline
+
+Work on branches, not main. Each branch covers one prompt or one coherent
+fix. Do not commit directly to main unless merging a completed branch.
+
+---
+
 ## Final Principle
 
 Continuity > silence
