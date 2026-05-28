@@ -1618,8 +1618,7 @@ mod tests {
             },
         );
 
-        let state =
-            AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
 
         state
             .staging_worker
