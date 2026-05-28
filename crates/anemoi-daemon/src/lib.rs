@@ -604,6 +604,10 @@ impl AppState {
         let pending = self.staging_worker.get_pending().await;
         for intent in pending {
             let runtime_id = intent.target_runtime.0.clone();
+            let is_mock = self.runtime_adapter_type(&runtime_id) == Some("mock");
+            if !is_mock && !live_execution_enabled() {
+                continue;
+            }
             if let Some(adapter) = self.runtimes.get(&runtime_id) {
                 match adapter.load_model(&intent.background_model).await {
                     Ok(_) => {
@@ -1593,6 +1597,49 @@ mod tests {
             still_pending.len(),
             1,
             "intent for unknown runtime should remain pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_tick_skips_non_mock_runtime_without_live_execution_flag() {
+        // Build a config with a non-mock adapter type. AppState::new() falls
+        // through to MockRuntimeAdapter for any unrecognised adapter string,
+        // but runtime_adapter_type() still returns the configured string, so
+        // the live-execution gate treats it as a live runtime.
+        let mut config = example_config();
+        let live_runtime_id = RuntimeId("live_rt".to_string());
+        config.runtimes.insert(
+            live_runtime_id.clone(),
+            RuntimeConfig {
+                adapter: "ollama".to_string(),
+                base_url: Some("http://127.0.0.1:11434".to_string()),
+                auth_token: None,
+                initial_residents: vec![],
+            },
+        );
+
+        let state =
+            AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+
+        state
+            .staging_worker
+            .unblock_and_queue(
+                Uuid::new_v4(),
+                None,
+                ModelId("qwen9b".to_string()),
+                live_runtime_id,
+                "should be held behind live gate".to_string(),
+            )
+            .await;
+
+        // ANEMOI_ENABLE_LIVE_EXECUTE is not set — tick must not fire the load.
+        state.run_staging_tick().await;
+
+        let still_pending = state.staging_worker.get_pending().await;
+        assert_eq!(
+            still_pending.len(),
+            1,
+            "non-mock staging intent should stay pending without ANEMOI_ENABLE_LIVE_EXECUTE"
         );
     }
 }
