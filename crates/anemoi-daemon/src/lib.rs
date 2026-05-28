@@ -21,6 +21,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 const DEFAULT_RECONCILIATION_TTL_MS: u64 = 5000;
+const DEFAULT_STAGING_POLL_MS: u64 = 5000;
 
 #[derive(Debug, Clone)]
 pub struct ReconciledSnapshot {
@@ -594,6 +595,31 @@ impl AppState {
                     self.reconciler
                         .record_error(runtime_id, e.to_string())
                         .await;
+                }
+            }
+        }
+    }
+
+    pub async fn run_staging_tick(&self) {
+        let pending = self.staging_worker.get_pending().await;
+        for intent in pending {
+            let runtime_id = intent.target_runtime.0.clone();
+            let is_mock = self.runtime_adapter_type(&runtime_id) == Some("mock");
+            if !is_mock && !live_execution_enabled() {
+                continue;
+            }
+            if let Some(adapter) = self.runtimes.get(&runtime_id) {
+                match adapter.load_model(&intent.background_model).await {
+                    Ok(_) => {
+                        self.staging_worker
+                            .update_state(intent.id, StagingState::Completed, None)
+                            .await;
+                    }
+                    Err(e) => {
+                        self.staging_worker
+                            .update_state(intent.id, StagingState::Failed, Some(e.to_string()))
+                            .await;
+                    }
                 }
             }
         }
@@ -1515,6 +1541,106 @@ mod tests {
         assert!(action.is_foreground);
         assert!(action.is_mutating);
     }
+
+    #[tokio::test]
+    async fn staging_tick_completes_pending_intent_for_correct_runtime() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        state
+            .staging_worker
+            .unblock_and_queue(
+                Uuid::new_v4(),
+                Some(ModelId("qwen9b".to_string())),
+                ModelId("granite8b".to_string()),
+                RuntimeId("mock".to_string()),
+                "background staging test".to_string(),
+            )
+            .await;
+
+        let before = state.staging_worker.get_pending().await;
+        assert_eq!(before.len(), 1, "one intent should be pending before tick");
+
+        state.run_staging_tick().await;
+
+        let after = state.staging_worker.get_pending().await;
+        assert_eq!(
+            after.len(),
+            0,
+            "pending intent should be processed after staging tick"
+        );
+
+        let all = state.staging_worker.get_all().await;
+        assert_eq!(all[0].state, StagingState::Completed);
+    }
+
+    #[tokio::test]
+    async fn staging_tick_skips_intent_with_unknown_runtime() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        state
+            .staging_worker
+            .unblock_and_queue(
+                Uuid::new_v4(),
+                None,
+                ModelId("granite8b".to_string()),
+                RuntimeId("nonexistent".to_string()),
+                "should be skipped".to_string(),
+            )
+            .await;
+
+        state.run_staging_tick().await;
+
+        let still_pending = state.staging_worker.get_pending().await;
+        assert_eq!(
+            still_pending.len(),
+            1,
+            "intent for unknown runtime should remain pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_tick_skips_non_mock_runtime_without_live_execution_flag() {
+        // Build a config with a non-mock adapter type. AppState::new() falls
+        // through to MockRuntimeAdapter for any unrecognised adapter string,
+        // but runtime_adapter_type() still returns the configured string, so
+        // the live-execution gate treats it as a live runtime.
+        let mut config = example_config();
+        let live_runtime_id = RuntimeId("live_rt".to_string());
+        config.runtimes.insert(
+            live_runtime_id.clone(),
+            RuntimeConfig {
+                adapter: "ollama".to_string(),
+                base_url: Some("http://127.0.0.1:11434".to_string()),
+                auth_token: None,
+                initial_residents: vec![],
+            },
+        );
+
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+
+        state
+            .staging_worker
+            .unblock_and_queue(
+                Uuid::new_v4(),
+                None,
+                ModelId("qwen9b".to_string()),
+                live_runtime_id,
+                "should be held behind live gate".to_string(),
+            )
+            .await;
+
+        // ANEMOI_ENABLE_LIVE_EXECUTE is not set — tick must not fire the load.
+        state.run_staging_tick().await;
+
+        let still_pending = state.staging_worker.get_pending().await;
+        assert_eq!(
+            still_pending.len(),
+            1,
+            "non-mock staging intent should stay pending without ANEMOI_ENABLE_LIVE_EXECUTE"
+        );
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -1533,6 +1659,27 @@ pub fn router(state: AppState) -> Router {
 }
 
 pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
+    let reconciliation_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(
+            DEFAULT_RECONCILIATION_TTL_MS / 2,
+        ));
+        loop {
+            interval.tick().await;
+            reconciliation_state.run_reconciliation_tick().await;
+        }
+    });
+
+    let staging_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_millis(DEFAULT_STAGING_POLL_MS));
+        loop {
+            interval.tick().await;
+            staging_state.run_staging_tick().await;
+        }
+    });
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router(state)).await?;
     Ok(())
