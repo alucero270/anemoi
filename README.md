@@ -14,8 +14,10 @@ Anemoi provides runtime selection, residency governance, and continuity preserva
 Anemoi owns the decision logic:
 - Request-to-domain-to-roster-to-residency-group scheduling.
 - Model residency state normalization (`cold`, `loading`, `warm_cpu`, `partial`, `hot_gpu`, `serving`, `draining`, `evicting`, `failed`).
-- Runtime inspection through adapters.
+- Runtime inspection through adapters, with a reconciliation loop that caches normalized snapshots and tracks TTL-based staleness.
 - Policy scoring and continuity fallback.
+- Background staging intents that pre-load models on target runtimes ahead of expected demand.
+- Action plans (`load`, `unload`, `keep`, `stage`, `defer`, `deny`, `noop`) that make every planned mutation explicit and dry-run-safe.
 - Decision telemetry and structured explanations.
 
 Anemoi is **not** an inference runtime, model host, provider gateway, or agent framework.
@@ -43,7 +45,7 @@ Anemoi schedules against residency groups, not raw model names:
 | `anemoi-runtime` | Runtime adapter trait and inspection adapters (Mock, LlamaSwap, Ollama, LlamaCpp). |
 | `anemoi-policy` | Deterministic scheduling, scoring, and continuity behavior. |
 | `anemoi-telemetry` | Decision logs and runtime/event telemetry. |
-| `anemoi-daemon` | Axum local control-plane API. |
+| `anemoi-daemon` | Axum local control-plane API, runtime reconciliation loop, background staging worker, and action-plan generation. |
 | `anemoi-cli` | Operator commands (`status`, `decide`, `explain`, `residents`). |
 | `anemoi-mcp` | MCP control-plane adapter. |
 
@@ -53,11 +55,13 @@ Anemoi schedules against residency groups, not raw model names:
 |---|---|
 | `GET /health` | Basic daemon health. |
 | `GET /status` | Runtime and policy summary. |
-| `GET /residents` | Current normalized residency view. |
+| `GET /residents` | Current normalized residency view, served from the reconciliation cache. |
 | `POST /decide` | Return a decision without executing inference. |
-| `POST /execute` | Decide, record, and return a model-load handoff response. |
+| `POST /execute` | Decide, generate an action plan, and return a model-load handoff response. |
+| `GET /staging` | List pending, completed, and failed background staging intents. |
 | `GET /decisions/:id` | Fetch a recorded decision. |
 | `GET /explain/:id` | Fetch the explanation for a recorded decision. |
+| `GET /openapi.json` | OpenAPI document for the control-plane API. |
 
 ## Configuration & Execution
 
