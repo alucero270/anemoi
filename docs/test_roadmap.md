@@ -48,10 +48,11 @@ hardening when the local toolchain has the `clippy` component installed.
 | 25 eviction and pinning policy | Keep-hot workers are protected and eviction plans are explainable and gated. | `anemoi-policy`, `anemoi-core`, `anemoi-runtime` | Pending |
 | 26 operator status surface | Status and CLI output show runtime health, residents, staging, policy, and unknown/stale state. | `anemoi-daemon`, `anemoi-cli` | Pending |
 | 27 durable event store | Optional SQLite history records decisions, snapshots, staging, action plans, and explanations. | `anemoi-telemetry`, `anemoi-daemon` | Pending |
+| 28 inference forwarding gateway | `POST /v1/chat/completions` maps model field to domain, runs decide, forwards to selected runtime, streams response. | `anemoi-daemon`, `anemoi-runtime`, `anemoi-core` | Pending |
 
 ## Current Focus
 
-Build prompts 00-20 are passing. Prompts 21-27 are defined and pending.
+Build prompts 00-20 are passing. Prompts 21-27 are defined and pending. Prompt 28 is the active priority: inference forwarding gateway to make Anemoi an OpenAI-compatible endpoint for opencode.
 
 Prompt 01 passed with:
 
