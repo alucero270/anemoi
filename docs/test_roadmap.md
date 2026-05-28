@@ -42,7 +42,7 @@ hardening when the local toolchain has the `clippy` component installed.
 | 19 live decision smoke | Read-only live snapshots feed real `/decide` and CLI decisions with recorded limitations. | `anemoi-daemon`, `anemoi-cli`, docs | Passing |
 | 20 controlled execution gate | Live load/unload/execution validation requires explicit approval and opt-in. | `anemoi-daemon`, `anemoi-runtime`, docs | Passing |
 | 21 runtime reconciliation loop | Runtime inspection feeds a fresh cached observed state without mutating runtimes. | `anemoi-daemon`, `anemoi-runtime` | Passing |
-| 22 background staging worker | Stage recommendations become observable staging intents and mock-executable jobs. | `anemoi-core`, `anemoi-daemon`, `anemoi-policy` | Pending |
+| 22 background staging worker | Stage recommendations become observable staging intents and mock-executable jobs. | `anemoi-core`, `anemoi-daemon`, `anemoi-policy` | Passing |
 | 23 load/unload action plan | Decisions produce explicit dry-run action plans before runtime mutation. | `anemoi-core`, `anemoi-daemon`, `anemoi-runtime` | Pending |
 | 24 resource pressure model | Candidate scoring uses explicit VRAM, RAM, KV, load, and active-request pressure evidence. | `anemoi-policy`, `anemoi-core` | Pending |
 | 25 eviction and pinning policy | Keep-hot workers are protected and eviction plans are explainable and gated. | `anemoi-policy`, `anemoi-core`, `anemoi-runtime` | Pending |

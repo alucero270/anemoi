@@ -1,5 +1,6 @@
 use anemoi_core::{
-    AnemoiConfig, Decision, InferenceRequest, ModelResident, RuntimeId, RuntimeSnapshot,
+    AnemoiConfig, Decision, DecisionAction, InferenceRequest, ModelId, ModelResident, RuntimeId,
+    RuntimeSnapshot,
 };
 use anemoi_policy::Scheduler;
 use anemoi_runtime::{
@@ -142,6 +143,161 @@ impl Default for Reconciler {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagingState {
+    Blocked,
+    Pending,
+    Failed,
+    Completed,
+}
+
+impl StagingState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Failed | Self::Completed)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagingIntent {
+    pub id: Uuid,
+    pub decision_id: Uuid,
+    pub foreground_model: Option<ModelId>,
+    pub background_model: ModelId,
+    pub target_runtime: RuntimeId,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+    pub state: StagingState,
+    pub last_error: Option<String>,
+}
+
+impl StagingIntent {
+    pub fn new(
+        decision_id: Uuid,
+        foreground_model: Option<ModelId>,
+        background_model: ModelId,
+        target_runtime: RuntimeId,
+        reason: String,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            decision_id,
+            foreground_model,
+            background_model,
+            target_runtime,
+            reason,
+            created_at: Utc::now(),
+            state: StagingState::Blocked,
+            last_error: None,
+        }
+    }
+
+    pub fn mark_pending(&mut self) {
+        self.state = StagingState::Pending;
+    }
+
+    pub fn mark_completed(&mut self) {
+        self.state = StagingState::Completed;
+    }
+
+    pub fn mark_failed(&mut self, error: String) {
+        self.state = StagingState::Failed;
+        self.last_error = Some(error);
+    }
+}
+
+#[derive(Clone)]
+pub struct StagingWorker {
+    queue: Arc<RwLock<Vec<StagingIntent>>>,
+}
+
+impl StagingWorker {
+    pub fn new() -> Self {
+        Self {
+            queue: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    pub async fn enqueue(&self, intent: StagingIntent) {
+        let mut queue = self.queue.write().await;
+        queue.push(intent);
+    }
+
+    pub async fn get_all(&self) -> Vec<StagingIntent> {
+        self.queue.read().await.clone()
+    }
+
+    pub async fn get_pending(&self) -> Vec<StagingIntent> {
+        let queue = self.queue.read().await;
+        queue
+            .iter()
+            .filter(|i| i.state == StagingState::Pending)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn update_state(
+        &self,
+        intent_id: Uuid,
+        new_state: StagingState,
+        error: Option<String>,
+    ) {
+        let mut queue = self.queue.write().await;
+        if let Some(intent) = queue.iter_mut().find(|i| i.id == intent_id) {
+            match new_state {
+                StagingState::Pending => intent.mark_pending(),
+                StagingState::Completed => intent.mark_completed(),
+                StagingState::Failed => intent.mark_failed(error.unwrap_or_default()),
+                StagingState::Blocked => {
+                    intent.state = StagingState::Blocked;
+                }
+            }
+        }
+    }
+
+    pub async fn execute_pending(&self, runtime: &DynRuntimeAdapter) -> anyhow::Result<()> {
+        let pending = self.get_pending().await;
+        for mut intent in pending {
+            match runtime.load_model(&intent.background_model).await {
+                Ok(_) => {
+                    self.update_state(intent.id, StagingState::Completed, None)
+                        .await;
+                }
+                Err(e) => {
+                    self.update_state(intent.id, StagingState::Failed, Some(e.to_string()))
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn unblock_and_queue(
+        &self,
+        decision_id: Uuid,
+        foreground_model: Option<ModelId>,
+        background_model: ModelId,
+        target_runtime: RuntimeId,
+        reason: String,
+    ) {
+        let mut intent = StagingIntent::new(
+            decision_id,
+            foreground_model,
+            background_model,
+            target_runtime,
+            reason,
+        );
+        intent.mark_pending();
+        self.enqueue(intent).await;
+    }
+}
+
+impl Default for StagingWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config: AnemoiConfig,
@@ -149,6 +305,7 @@ pub struct AppState {
     runtimes: HashMap<String, DynRuntimeAdapter>,
     decision_log: DynDecisionLog,
     reconciler: Reconciler,
+    staging_worker: StagingWorker,
 }
 
 impl AppState {
@@ -203,6 +360,7 @@ impl AppState {
         }
 
         let reconciler = Reconciler::default();
+        let staging_worker = StagingWorker::new();
 
         Ok(Self {
             config,
@@ -210,6 +368,7 @@ impl AppState {
             runtimes,
             decision_log,
             reconciler,
+            staging_worker,
         })
     }
 
@@ -242,6 +401,7 @@ impl AppState {
         }
 
         let reconciler = Reconciler::default();
+        let staging_worker = StagingWorker::new();
 
         Ok(Self {
             config,
@@ -249,11 +409,16 @@ impl AppState {
             runtimes,
             decision_log: Arc::new(InMemoryDecisionLog::default()),
             reconciler,
+            staging_worker,
         })
     }
 
     pub fn reconciler(&self) -> Reconciler {
         self.reconciler.clone()
+    }
+
+    pub fn staging_worker(&self) -> StagingWorker {
+        self.staging_worker.clone()
     }
 
     pub async fn snapshots(&self) -> Vec<RuntimeSnapshot> {
@@ -274,6 +439,24 @@ impl AppState {
             self.snapshots().await
         };
         let decision = self.scheduler.decide(request, &snapshots)?;
+
+        if decision.action == DecisionAction::StageBackground {
+            if let (Some(runtime_id), Some(model_id)) =
+                (&decision.selected_runtime, &decision.background_model)
+            {
+                let reason = decision.explanation.summary.clone();
+                self.staging_worker
+                    .unblock_and_queue(
+                        decision.id,
+                        decision.selected_model.clone(),
+                        model_id.clone(),
+                        runtime_id.clone(),
+                        reason,
+                    )
+                    .await;
+            }
+        }
+
         self.decision_log.record_decision(&decision).await?;
         Ok(decision)
     }
@@ -877,6 +1060,170 @@ mod tests {
             "decision should use reconciled snapshot"
         );
     }
+
+    #[tokio::test]
+    async fn stage_background_decision_enqueues_staging_intent() {
+        let mut config = example_config();
+        config.continuity.background_load = true;
+        config.continuity.keep_small_worker_hot = true;
+
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+
+        let staging_worker = state.staging_worker();
+        assert!(
+            staging_worker.get_all().await.is_empty(),
+            "staging queue should be empty initially"
+        );
+
+        state.decide(&sample_request()).await.expect("decision");
+
+        let intents = staging_worker.get_all().await;
+        assert!(
+            !intents.is_empty(),
+            "StageBackground decision should enqueue staging intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_worker_does_not_mutate_live_runtime_without_enable_flag() {
+        let config = example_config();
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+
+        let staging_worker = state.staging_worker();
+
+        let intent = StagingIntent::new(
+            Uuid::new_v4(),
+            Some(ModelId("qwen9b".to_string())),
+            ModelId("qwen35_a3b".to_string()),
+            RuntimeId("mock".to_string()),
+            "background staging test".to_string(),
+        );
+        staging_worker.enqueue(intent).await;
+
+        staging_worker
+            .execute_pending(state.runtimes.get("mock").expect("mock runtime"))
+            .await
+            .expect("execute should not panic");
+
+        let intents = staging_worker.get_all().await;
+        assert!(
+            !intents.is_empty(),
+            "intents should still exist after execution attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_worker_can_load_model_on_mock_runtime() {
+        let config = example_config();
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+
+        let staging_worker = state.staging_worker();
+
+        let mut intent = StagingIntent::new(
+            Uuid::new_v4(),
+            Some(ModelId("qwen9b".to_string())),
+            ModelId("qwen35_a3b".to_string()),
+            RuntimeId("mock".to_string()),
+            "background staging test".to_string(),
+        );
+        intent.mark_pending();
+        staging_worker.enqueue(intent).await;
+
+        let mock_runtime = state.runtimes.get("mock").expect("mock runtime");
+
+        staging_worker
+            .execute_pending(&mock_runtime)
+            .await
+            .expect("execute should succeed");
+
+        let intents = staging_worker.get_all().await;
+        let completed = intents.iter().find(|i| i.state == StagingState::Completed);
+        assert!(
+            completed.is_some(),
+            "staging should complete on mock runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_status_reports_pending_blocked_failed_and_completed() {
+        let config = example_config();
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+
+        let staging_worker = state.staging_worker();
+
+        let blocked_intent = StagingIntent::new(
+            Uuid::new_v4(),
+            Some(ModelId("qwen9b".to_string())),
+            ModelId("qwen35_a3b".to_string()),
+            RuntimeId("mock".to_string()),
+            "blocked test".to_string(),
+        );
+        staging_worker.enqueue(blocked_intent).await;
+
+        let mut pending_intent = StagingIntent::new(
+            Uuid::new_v4(),
+            Some(ModelId("qwen9b".to_string())),
+            ModelId("qwen35_a3b".to_string()),
+            RuntimeId("mock".to_string()),
+            "pending test".to_string(),
+        );
+        pending_intent.mark_pending();
+        staging_worker.enqueue(pending_intent).await;
+
+        let mut failed_intent = StagingIntent::new(
+            Uuid::new_v4(),
+            Some(ModelId("qwen9b".to_string())),
+            ModelId("qwen35_a3b".to_string()),
+            RuntimeId("mock".to_string()),
+            "failed test".to_string(),
+        );
+        failed_intent.mark_failed("test error".to_string());
+        staging_worker.enqueue(failed_intent).await;
+
+        let mut completed_intent = StagingIntent::new(
+            Uuid::new_v4(),
+            Some(ModelId("qwen9b".to_string())),
+            ModelId("qwen35_a3b".to_string()),
+            RuntimeId("mock".to_string()),
+            "completed test".to_string(),
+        );
+        completed_intent.mark_completed();
+        staging_worker.enqueue(completed_intent).await;
+
+        let all = staging_worker.get_all().await;
+
+        let has_blocked = all.iter().any(|i| i.state == StagingState::Blocked);
+        let has_pending = all.iter().any(|i| i.state == StagingState::Pending);
+        let has_failed = all.iter().any(|i| i.state == StagingState::Failed);
+        let has_completed = all.iter().any(|i| i.state == StagingState::Completed);
+
+        assert!(has_blocked, "should have blocked intent");
+        assert!(has_pending, "should have pending intent");
+        assert!(has_failed, "should have failed intent");
+        assert!(has_completed, "should have completed intent");
+    }
+
+    #[tokio::test]
+    async fn staging_intent_records_decision_id_model_runtime_and_reason() {
+        let decision_id = Uuid::new_v4();
+        let model_id = ModelId("qwen35_a3b".to_string());
+        let runtime_id = RuntimeId("mock".to_string());
+        let reason = "background staging for quality upgrade".to_string();
+
+        let intent = StagingIntent::new(
+            decision_id,
+            Some(ModelId("qwen9b".to_string())),
+            model_id.clone(),
+            runtime_id.clone(),
+            reason.clone(),
+        );
+
+        assert_eq!(intent.decision_id, decision_id);
+        assert_eq!(intent.background_model, model_id);
+        assert_eq!(intent.target_runtime, runtime_id);
+        assert_eq!(intent.reason, reason);
+        assert!(intent.foreground_model.is_some());
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -888,6 +1235,7 @@ pub fn router(state: AppState) -> Router {
         .route("/execute", post(execute))
         .route("/decisions/:id", get(decision))
         .route("/explain/:id", get(explain))
+        .route("/staging", get(staging))
         .route("/openapi.json", get(openapi))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -1180,6 +1528,10 @@ async fn residents(State(state): State<AppState>) -> Json<Vec<RuntimeSnapshot>> 
         state.snapshots().await
     };
     Json(snapshots)
+}
+
+async fn staging(State(state): State<AppState>) -> Json<Vec<StagingIntent>> {
+    Json(state.staging_worker.get_all().await)
 }
 
 async fn decide(
