@@ -1,0 +1,123 @@
+# Anemoi config for prometheus — real llama-swap runtime.
+#
+# Set before running:
+#   export ANEMOI_LLAMA_SWAP_BASE_URL=http://172.17.0.1:8085
+#   export ANEMOI_LLAMA_SWAP_AUTH_TOKEN=LOCAL
+#   export ANEMOI_CONFIG=/home/alex/anemoi/config/anemoi.prometheus.yaml
+#   export ANEMOI_BIND=127.0.0.1:7070
+#
+# No secrets committed here.
+
+domains:
+  coding:
+    rosters:
+      - small_swarm
+      - medium_workers
+      - large_context
+
+residency_groups:
+  small_swarm:
+    purpose:
+      - fast interactive coding
+      - tool calling
+      - quick edits
+    keep_hot: true
+    allow_background_load: true
+    models:
+      - qwen3.5-9b-gpu
+      - granite-4.1-8b-gpu
+
+  medium_workers:
+    purpose:
+      - coding synthesis
+      - code review
+      - architecture discussion
+    keep_hot: false
+    allow_background_load: true
+    models:
+      - qwen3.6-35b-a3b-mtp
+      - gemma-4-26b-a4b-it-mtp
+
+  large_context:
+    purpose:
+      - large codebase analysis
+      - long context tasks
+      - deep reasoning
+    keep_hot: false
+    allow_background_load: false
+    models:
+      - minimax-256k
+      - qwen3.5-122b-a10b-mtp
+
+models:
+  qwen3.5-9b-gpu:
+    family: qwen
+    parameter_class: 9b
+    context_window: 32768
+    vram_required_mb: 7000
+    ram_required_mb: 0
+    cold_load_estimate_ms: 8000
+    supported_runtimes:
+      - llama_swap
+
+  granite-4.1-8b-gpu:
+    family: granite
+    parameter_class: 8b
+    context_window: 32768
+    vram_required_mb: 6000
+    ram_required_mb: 0
+    cold_load_estimate_ms: 6000
+    supported_runtimes:
+      - llama_swap
+
+  qwen3.6-35b-a3b-mtp:
+    family: qwen
+    parameter_class: 35b
+    context_window: 32768
+    vram_required_mb: 12000
+    ram_required_mb: 20000
+    cold_load_estimate_ms: 30000
+    supported_runtimes:
+      - llama_swap
+
+  gemma-4-26b-a4b-it-mtp:
+    family: gemma
+    parameter_class: 26b
+    context_window: 32768
+    vram_required_mb: 14000
+    ram_required_mb: 16000
+    cold_load_estimate_ms: 25000
+    supported_runtimes:
+      - llama_swap
+
+  minimax-256k:
+    family: minimax
+    parameter_class: large
+    context_window: 262144
+    vram_required_mb: 8000
+    ram_required_mb: 40000
+    cold_load_estimate_ms: 60000
+    supported_runtimes:
+      - llama_swap
+
+  qwen3.5-122b-a10b-mtp:
+    family: qwen
+    parameter_class: 122b
+    context_window: 32768
+    vram_required_mb: 8000
+    ram_required_mb: 80000
+    cold_load_estimate_ms: 90000
+    supported_runtimes:
+      - llama_swap
+
+runtimes:
+  llama_swap:
+    adapter: llama_swap
+    base_url: "${ANEMOI_LLAMA_SWAP_BASE_URL}"
+    auth_token: "${ANEMOI_LLAMA_SWAP_AUTH_TOKEN}"
+
+continuity:
+  keep_small_worker_hot: true
+  background_load: true
+  max_blank_wait_ms: 2000
+  prefer_degraded_response_over_silence: true
