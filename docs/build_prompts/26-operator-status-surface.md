@@ -8,6 +8,20 @@ of JSON endpoints.
 This does not require a full web UI. A rich CLI/status surface is acceptable for
 this prompt.
 
+## Supplemental Context
+
+Read **GitHub issue #17** (Diagnostics endpoint and route visibility) alongside
+this prompt. Issue #17 defines the consolidated diagnostics view that this
+prompt implements. Key additions:
+
+- `GET /status` must return all governance state in a single call — runtime
+  availability, snapshot freshness, residents by domain/group, staging queue
+  summary, recent decision count, policy warnings, and live execution gate state
+- All data comes from the reconciled snapshot cache (prompt 21); this endpoint
+  must not trigger live inspection
+- Stale and unknown states must be labeled explicitly — never silently omitted
+  or represented as empty arrays
+
 ## Scope
 
 Allowed:
@@ -39,33 +53,42 @@ Add failing tests first:
 Create an operator summary model. It should include:
 
 - runtime availability
-- snapshot freshness
+- snapshot freshness (from prompt 21 reconciliation cache)
 - residents by runtime
 - residents by group when known
 - active requests
-- staging queue summary
+- staging queue summary (from prompt 22)
 - recent decision count
-- policy warnings
-- live execution gate state
+- policy warnings (e.g., keep-hot group has no hot residents)
+- live execution gate state (`ANEMOI_ENABLE_LIVE_EXECUTE` on/off)
+- unknown / stale labels wherever data is missing or aged
 
-Expose it through:
+Expose through:
 
-- `GET /status`
-- `anemoi status`
+- `GET /status` — structured JSON
+- `anemoi status` — human-readable table
 
-Keep raw `/residents` available for machine-readable details.
+Keep raw `/residents` available for machine-readable detail.
 
 ## Acceptance Criteria
 
-- A human can tell what Anemoi thinks is resident and why.
-- Stale, failed, and unknown states are visible.
+- A human can tell what Anemoi thinks is resident and why from a single
+  `GET /status` or `anemoi status` call.
+- Stale, failed, and unknown states are visible and labeled — never silently
+  omitted.
 - CLI status output is useful without reading raw JSON.
 - Existing API compatibility is preserved or versioned intentionally.
+
+## Dependencies
+
+- Prompt 21 (runtime reconciliation loop) — status uses reconciled snapshot cache
+- Prompt 22 (background staging worker) — staging queue summary in status
+- GitHub issue #17 — consolidated diagnostics view design
 
 ## Validation
 
 ```powershell
 cargo fmt --check
 cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
-
