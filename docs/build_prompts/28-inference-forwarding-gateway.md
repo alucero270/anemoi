@@ -8,6 +8,54 @@ the model field. Anemoi decides which runtime model to use, forwards the
 request to the selected runtime, and streams the response back. The caller
 never selects a model directly.
 
+## Supplemental Context
+
+Read these GitHub issues alongside this prompt — they define prerequisites
+that must be implemented as part of this prompt:
+
+### Issue #8 — Add `supports_streaming` to `ModelProfileConfig`
+
+Add `supports_streaming: Option<bool>` to `ModelProfileConfig` in
+`anemoi-core` before implementing the forwarding handler.
+
+Rules:
+- Default to `None` (unknown) when absent from config YAML — do not default
+  to `false`
+- `None` means unknown; treat as permissive (do not block forwarding)
+- `false` means explicitly non-streaming; warn or reject when `stream: true`
+  is requested against such a model
+- Absence of the field in YAML must parse without error
+- Update `config/anemoi.example.yaml` and `config/anemoi.prometheus.yaml`
+  with the field where known
+
+### Issue #15 — `GET /v1/models` domain catalog
+
+Add `GET /v1/models` returning the domain catalog in OpenAI list format.
+This is required so OpenAI-compatible clients like opencode can discover
+available domains.
+
+Response format:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "coding",
+      "object": "model",
+      "owned_by": "anemoi",
+      "anemoi_domain": true
+    }
+  ]
+}
+```
+
+Rules:
+- `id` is the domain name — what the caller puts in `model` for chat completions
+- Runtime model IDs must not appear in the response
+- `anemoi_domain: true` marks these as governance domains, not raw model IDs
+- No live inspection triggered by this call — use reconciled state if available
+
 ## Context
 
 Prompts 00-20 proved the governance loop: Anemoi inspects runtimes, scores
@@ -31,26 +79,28 @@ This prompt adds forwarding only. It does not add:
 
 ## Design
 
-### Endpoint
+### Endpoints
 
 ```
-POST /v1/chat/completions
+GET  /v1/models               ← domain catalog (see issue #15)
+POST /v1/chat/completions     ← inference forwarding
 ```
 
-Request: standard OpenAI chat completions payload. The `model` field is
-treated as a **domain hint**, not a literal model name.
+### Domain extraction
 
-Examples:
-- `"model": "coding"` → domain `coding`
-- `"model": "anemoi-coding"` → domain `coding` (strip `anemoi-` prefix)
-- `"model": "general"` → domain `general`
+The `model` field is treated as a **domain hint**, not a literal model name:
 
-If the domain is unknown, return a structured error before forwarding.
+| Input `model` | Resolved domain |
+|---|---|
+| `"coding"` | `coding` |
+| `"anemoi-coding"` | `coding` (strip `anemoi-` prefix) |
+| `"general"` | `general` |
+| unknown domain | 400 structured error, no forwarding |
 
 ### Decision flow
 
 ```
-receive request
+receive POST /v1/chat/completions
   extract domain from model field
   build DecideRequest (domain, mode: interactive, latency_budget_ms: from config or default)
   run policy decide (same path as POST /decide)
@@ -74,17 +124,13 @@ receive request
 Forwarding to a non-mock runtime requires `ANEMOI_ENABLE_LIVE_EXECUTE=1`
 (established in prompt 20). Mock runtime forwarding is always allowed.
 
-### Response augmentation
-
-Add a response header:
+### Response headers
 
 ```
 X-Anemoi-Decision-Id: <decision-id>
 X-Anemoi-Selected-Model: <selected-model>
 X-Anemoi-Action: <action>
 ```
-
-This lets the caller retrieve the explanation without parsing the body.
 
 ## Required Tests
 
@@ -110,9 +156,9 @@ Required test names:
 
 | Crate | Change |
 |---|---|
-| `anemoi-daemon` | Add `/v1/chat/completions` handler. Add domain extraction from model field. Add forwarding client. Add response header injection. |
-| `anemoi-runtime` | Add `forward_chat_completion` to the adapter trait or as a standalone HTTP client helper. Mock adapter returns a canned streaming response. |
-| `anemoi-core` | Add `InferenceRequest` and `InferenceResponse` types if needed. |
+| `anemoi-core` | Add `supports_streaming: Option<bool>` to `ModelProfileConfig`. Add `InferenceRequest`/`InferenceResponse` types if needed. |
+| `anemoi-runtime` | Add `forward_chat_completion` to the adapter trait or as a standalone HTTP client helper. Mock adapter returns a deterministic SSE response. |
+| `anemoi-daemon` | Add `GET /v1/models` handler. Add `POST /v1/chat/completions` handler. Add domain extraction. Add forwarding client. Add response header injection. |
 
 ### Mock forwarding
 
@@ -127,6 +173,7 @@ The forwarding client must support chunked transfer from the runtime.
 
 ## Acceptance Criteria
 
+- `GET /v1/models` returns the domain catalog in OpenAI list format.
 - opencode configured with `baseURL: https://anemoi.home.arpa/v1` and
   `model: coding` receives a valid streaming chat completion response.
 - The decision is recorded in telemetry and retrievable via `/explain/:id`.
@@ -134,6 +181,12 @@ The forwarding client must support chunked transfer from the runtime.
 - Non-mock forwarding is blocked without `ANEMOI_ENABLE_LIVE_EXECUTE=1`.
 - Unknown domain returns a 400 with a structured explanation before forwarding.
 - All 11 required tests pass.
+
+## Dependencies
+
+- Prompt 20 (controlled execution gate) — `ANEMOI_ENABLE_LIVE_EXECUTE` guard
+- Issue #8 — `supports_streaming` on `ModelProfileConfig` (implement first)
+- Issue #15 — `GET /v1/models` domain catalog (implement as part of this prompt)
 
 ## Validation
 
