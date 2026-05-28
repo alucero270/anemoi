@@ -276,6 +276,16 @@ Each task must build understanding from:
 Use repository evidence over assumptions. Use `TBD`, `Unknown`, or `Needs
 validation` instead of guessing.
 
+If required context is missing and the gap is material:
+
+- **STOP** execution
+- report the missing information or conflict
+- do not guess
+
+Reasonable implementation-level assumptions are allowed when they stay within
+prompt scope, do not violate documented architecture, and do not invent new
+product behavior.
+
 ---
 
 ## 15. Anti-Patterns
@@ -290,6 +300,200 @@ Do not:
 - erase legacy files without an explicit migration task
 - weaken local-first or security constraints
 - claim a runtime adapter is complete because a mock test passed
+
+---
+
+## 17. Delivery Rules
+
+- Every change must reference a GitHub issue. If none exists, stop and create
+  one or request direction before proceeding.
+- Implementation work happens on a branch named
+  `issue/<issue-number>-<short-name>`.
+- Do not make agent-written changes directly on `main`. Use an issue branch.
+- One issue, one branch, one PR — unless a human explicitly directs otherwise.
+- PRs that fully satisfy an issue must use `Closes #N` in the PR body so
+  GitHub auto-closes the issue on merge. Use `References #N` only for related
+  or partial work that should not auto-close.
+
+---
+
+## 18. Local Agent Safety Policy
+
+Treat the primary checkout as protected and recoverable. Agent-written changes
+belong on an issue branch, not directly on `main`, unless the user explicitly
+permits it.
+
+### 18.1 Baseline Capture
+
+Before any agent-written edit batch, capture:
+
+```powershell
+git status --short --branch
+git rev-parse HEAD
+git diff --stat
+```
+
+If the working tree is dirty with unrelated work, do not edit in place. Use a
+clean sibling worktree or stop and report the conflict.
+
+### 18.2 Protected Files
+
+These files require an explicit user request before editing:
+
+- `AGENTS.md`
+- `CONTRIBUTING.md`
+- `README.md`
+- `.github/workflows/*`
+
+Protected does not mean never edit. It means edits must be intentional,
+scoped, and called out in the commit message.
+
+`Cargo.toml` and `Cargo.lock` are not protected, but edits must stay within
+the crate scope of the current prompt and be noted in the PR body.
+
+### 18.3 Safety Checks
+
+After every edit batch and before committing, verify:
+
+```powershell
+git diff --check
+git status --short --branch
+```
+
+Also scan for conflict markers and encoding corruption:
+
+```powershell
+rg -n "<<<<<<<|=======|>>>>>>>" --glob "!target/**"
+```
+
+If conflict markers, mojibake, or unexpected broad file churn appear — stop.
+Do not ask the same agent context to repair its own corrupted output. Restore
+from the baseline or discard the worktree.
+
+### 18.4 Timeout and Corruption Rules
+
+Any timeout makes the run suspect. After a timeout, run safety checks and
+inspect changed files before continuing. If the work is not coherent, discard
+and restart from a clean state.
+
+### 18.5 Task Size
+
+Match task size to risk.
+
+Lower-risk tasks for agent execution:
+
+- single-file edits
+- focused tests for one rule
+- config changes within a single crate
+- adding a build prompt document
+
+Higher-risk tasks that need explicit review and isolation:
+
+- repo-wide renames or restructuring
+- workflow or CI changes
+- governance file changes (`AGENTS.md`, `CONTRIBUTING.md`)
+- any change touching multiple crate boundaries at once
+- continuation after a timeout or partial failure
+
+---
+
+## 19. Issue Workflow
+
+All agent work must satisfy these requirements.
+
+### 19.1 Starting State
+
+Before starting any issue work, determine whether this is new issue work or
+continuation of an existing branch.
+
+For all issue work:
+
+- confirm current branch
+- confirm `origin` remote
+- confirm working tree status
+- identify the GitHub issue number and expected branch name
+
+For continuation of an existing issue branch:
+
+- stay on or switch to the existing branch
+- do not recreate the branch from `main`
+- do not abandon existing branch work to satisfy a fresh-start rule
+- inspect branch status, upstream, and uncommitted changes before editing
+
+For new issue work:
+
+- start from updated `main`
+- pull `origin/main` immediately before creating the issue branch
+- create the branch in a clean checkout
+
+If the current checkout is dirty with unrelated changes, use a clean sibling
+worktree from updated `main` rather than disturbing the existing checkout.
+
+### 19.2 Branching
+
+Create one branch per issue:
+
+```
+issue/<issue-number>-<short-name>
+```
+
+If the correct issue branch already exists locally or remotely, use it instead
+of creating a duplicate. If multiple plausible branches exist for the same
+issue, stop and report the options.
+
+### 19.3 Execution
+
+For each issue:
+
+1. Confirm the prompt is narrowly scoped and has declared required test names.
+2. Review scope, acceptance criteria, dependencies, and relevant build prompt
+   doc in `docs/build_prompts/`.
+3. Implement only that prompt.
+4. Avoid unrelated changes.
+5. Run the required validation: `cargo fmt --check` and `cargo test --workspace`.
+6. Confirm the required test names appear by name in `cargo test` output.
+7. Update `docs/test_roadmap.md` to `Passing` in the same commit.
+8. Open a PR targeting `main` with `Closes #N` in the body.
+9. Stop after the PR is open unless explicitly asked to continue.
+
+### 19.4 Stop Conditions
+
+Stop and report instead of improvising when:
+
+- the prompt scope is materially unclear or contradictory
+- the current branch does not match the expected issue branch
+- multiple existing branches appear to belong to the same issue
+- required test names have not been declared upfront
+- required context, dependency, or approval is missing
+- protected files need edits without explicit user approval
+- `cargo test --workspace` fails and cannot be resolved within prompt scope
+- safety checks show conflict markers, corruption, or unexpected broad churn
+- proceeding would require an architecture violation
+
+When stopping, report: the issue number, current branch state, the conflict or
+missing information, impacted files, and the recommended next action.
+
+### 19.5 Cleanup After Merge
+
+After a branch is merged:
+
+- delete the completed branch locally: `git branch -d <branch>`
+- delete the completed branch on GitHub: `git push origin --delete <branch>`
+- remove any sibling worktree used for that issue
+- verify the surviving `main` checkout contains the merged commit before
+  deleting a worktree
+
+---
+
+## 20. Priority Order
+
+When requirements conflict, apply this order:
+
+1. Respect prompt scope
+2. Satisfy acceptance criteria and required test names
+3. Preserve architecture (AGENTS.md crate boundaries, anti-patterns)
+4. Preserve workflow integrity (issue branch, roadmap update, commit cadence)
+5. Then implement functionality
 
 ---
 
