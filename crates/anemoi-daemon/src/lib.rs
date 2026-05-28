@@ -1,6 +1,6 @@
 use anemoi_core::{
-    AnemoiConfig, Decision, DecisionAction, InferenceRequest, ModelId, ModelResident, RuntimeId,
-    RuntimeSnapshot,
+    ActionKind, ActionPlan, AnemoiConfig, Decision, DecisionAction, InferenceRequest, ModelId,
+    ModelResident, RuntimeId, RuntimeSnapshot,
 };
 use anemoi_policy::Scheduler;
 use anemoi_runtime::{
@@ -461,6 +461,122 @@ impl AppState {
         Ok(decision)
     }
 
+    pub fn generate_action_plan(&self, decision: &Decision, dry_run: bool) -> ActionPlan {
+        let mut plan = ActionPlan::new(decision.id, dry_run);
+
+        match decision.action {
+            DecisionAction::ReuseHot => {
+                plan.add_noop(
+                    decision
+                        .selected_runtime
+                        .clone()
+                        .unwrap_or_else(|| RuntimeId("unknown".to_string())),
+                    "Reuse hot model - no action needed".to_string(),
+                );
+            }
+            DecisionAction::PromoteWarm => {
+                if let (Some(runtime_id), Some(model_id)) =
+                    (&decision.selected_runtime, &decision.selected_model)
+                {
+                    plan.add_load(
+                        runtime_id.clone(),
+                        model_id.clone(),
+                        true,
+                        "Promote warm model to hot".to_string(),
+                        decision
+                            .selected_model
+                            .as_ref()
+                            .and_then(|_| self.config.models.get(model_id))
+                            .and_then(|p| p.cold_load_estimate_ms),
+                    );
+                }
+            }
+            DecisionAction::ColdLoad => {
+                if let (Some(runtime_id), Some(model_id)) =
+                    (&decision.selected_runtime, &decision.selected_model)
+                {
+                    plan.add_load(
+                        runtime_id.clone(),
+                        model_id.clone(),
+                        true,
+                        "Cold load required model".to_string(),
+                        decision
+                            .selected_model
+                            .as_ref()
+                            .and_then(|_| self.config.models.get(model_id))
+                            .and_then(|p| p.cold_load_estimate_ms),
+                    );
+                }
+            }
+            DecisionAction::StageBackground => {
+                if let Some(runtime_id) = &decision.selected_runtime {
+                    if let Some(model_id) = &decision.background_model {
+                        plan.add_load(
+                            runtime_id.clone(),
+                            model_id.clone(),
+                            false,
+                            "Background staging load".to_string(),
+                            self.config
+                                .models
+                                .get(model_id)
+                                .and_then(|p| p.cold_load_estimate_ms),
+                        );
+                    }
+                }
+            }
+            DecisionAction::Downgrade | DecisionAction::Defer | DecisionAction::Deny => {
+                plan.add_noop(
+                    decision
+                        .selected_runtime
+                        .clone()
+                        .unwrap_or_else(|| RuntimeId("none".to_string())),
+                    format!("{:?} - no action", decision.action),
+                );
+            }
+        }
+
+        plan
+    }
+
+    pub async fn execute_action_plan(&self, plan: &ActionPlan) -> anyhow::Result<Vec<String>> {
+        let mut results = Vec::new();
+
+        if plan.dry_run {
+            return Ok(results);
+        }
+
+        if !live_execution_enabled() {
+            return Err(anyhow::anyhow!(
+                "Live execution requires ANEMOI_ENABLE_LIVE_EXECUTE=1"
+            ));
+        }
+
+        for action in &plan.actions {
+            if action.kind == ActionKind::Load {
+                if let Some(model_id) = &action.model_id {
+                    if let Some(runtime) = self.runtimes.get(&action.runtime_id.to_string()) {
+                        match runtime.load_model(model_id).await {
+                            Ok(handle) => {
+                                results.push(format!(
+                                    "Loaded {} on {} (handle: {})",
+                                    model_id, action.runtime_id, handle.id
+                                ));
+                            }
+                            Err(e) => {
+                                results.push(format!(
+                                    "Failed to load {} on {}: {}",
+                                    model_id, action.runtime_id, e
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     pub fn runtime_adapter_type(&self, runtime_id: &str) -> Option<&str> {
         self.config
             .runtimes
@@ -663,10 +779,9 @@ mod tests {
         let execute: ExecuteResponse =
             serde_json::from_value(json_body(response).await).expect("execute response");
 
-        assert!(execute.handoff.load_requested);
         assert!(!execute.handoff.full_inference_forwarded);
-        assert!(execute.handoff.message.contains("model-load handoff only"));
         assert!(execute.decision.selected_model.is_some());
+        assert!(!execute.action_plan.actions.is_empty() || execute.action_plan.dry_run);
     }
 
     #[tokio::test]
@@ -1224,6 +1339,182 @@ mod tests {
         assert_eq!(intent.reason, reason);
         assert!(intent.foreground_model.is_some());
     }
+
+    #[tokio::test]
+    async fn decision_action_plan_contains_foreground_load_when_required() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        let decision = Decision {
+            id: Uuid::new_v4(),
+            request_id: RequestId::new(),
+            action: DecisionAction::ColdLoad,
+            selected_model: Some(ModelId("qwen35_a3b".to_string())),
+            selected_runtime: Some(RuntimeId("mock".to_string())),
+            selected_group: None,
+            background_model: None,
+            score: anemoi_core::DecisionScore::default(),
+            explanation: anemoi_core::Explanation {
+                summary: "Cold load required".to_string(),
+                reasons: vec![],
+                rejected_options: vec![],
+            },
+            created_at: chrono::Utc::now(),
+        };
+
+        let plan = state.generate_action_plan(&decision, true);
+
+        assert!(
+            plan.get_foreground_load().is_some(),
+            "action plan should contain foreground load for cold load decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_background_action_plan_contains_background_load_intent() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        let decision = Decision {
+            id: Uuid::new_v4(),
+            request_id: RequestId::new(),
+            action: DecisionAction::StageBackground,
+            selected_model: Some(ModelId("qwen9b".to_string())),
+            selected_runtime: Some(RuntimeId("mock".to_string())),
+            selected_group: None,
+            background_model: Some(ModelId("qwen35_a3b".to_string())),
+            score: anemoi_core::DecisionScore::default(),
+            explanation: anemoi_core::Explanation {
+                summary: "Stage background".to_string(),
+                reasons: vec![],
+                rejected_options: vec![],
+            },
+            created_at: chrono::Utc::now(),
+        };
+
+        let plan = state.generate_action_plan(&decision, true);
+
+        assert!(
+            plan.get_background_load().is_some(),
+            "action plan should contain background load for stage background decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn reuse_hot_action_plan_contains_no_mutating_action() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        let decision = Decision {
+            id: Uuid::new_v4(),
+            request_id: RequestId::new(),
+            action: DecisionAction::ReuseHot,
+            selected_model: Some(ModelId("qwen9b".to_string())),
+            selected_runtime: Some(RuntimeId("mock".to_string())),
+            selected_group: None,
+            background_model: None,
+            score: anemoi_core::DecisionScore::default(),
+            explanation: anemoi_core::Explanation {
+                summary: "Reuse hot".to_string(),
+                reasons: vec![],
+                rejected_options: vec![],
+            },
+            created_at: chrono::Utc::now(),
+        };
+
+        let plan = state.generate_action_plan(&decision, true);
+
+        assert!(
+            !plan.has_mutating_actions(),
+            "action plan for reuse_hot should contain no mutating actions"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_plan_dry_run_does_not_call_runtime_adapter() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        let decision = Decision {
+            id: Uuid::new_v4(),
+            request_id: RequestId::new(),
+            action: DecisionAction::ColdLoad,
+            selected_model: Some(ModelId("qwen35_a3b".to_string())),
+            selected_runtime: Some(RuntimeId("mock".to_string())),
+            selected_group: None,
+            background_model: None,
+            score: anemoi_core::DecisionScore::default(),
+            explanation: anemoi_core::Explanation {
+                summary: "Cold load".to_string(),
+                reasons: vec![],
+                rejected_options: vec![],
+            },
+            created_at: chrono::Utc::now(),
+        };
+
+        let plan = state.generate_action_plan(&decision, true);
+
+        assert!(plan.dry_run, "action plan should be dry run");
+        assert!(
+            plan.actions.iter().all(|a| !a.is_mutating || plan.dry_run),
+            "dry run plan should not execute mutating actions"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_action_plan_execution_requires_explicit_enable_flag() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        let mut plan = ActionPlan::new(Uuid::new_v4(), false);
+        plan.add_load(
+            RuntimeId("mock".to_string()),
+            ModelId("qwen35_a3b".to_string()),
+            true,
+            "Test load".to_string(),
+            None,
+        );
+
+        let result = state.execute_action_plan(&plan).await;
+        assert!(
+            result.is_err(),
+            "live execution should fail without ANEMOI_ENABLE_LIVE_EXECUTE=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_plan_explanation_lists_each_planned_action() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        let decision = Decision {
+            id: Uuid::new_v4(),
+            request_id: RequestId::new(),
+            action: DecisionAction::ColdLoad,
+            selected_model: Some(ModelId("qwen35_a3b".to_string())),
+            selected_runtime: Some(RuntimeId("mock".to_string())),
+            selected_group: None,
+            background_model: None,
+            score: anemoi_core::DecisionScore::default(),
+            explanation: anemoi_core::Explanation {
+                summary: "Cold load required".to_string(),
+                reasons: vec![],
+                rejected_options: vec![],
+            },
+            created_at: chrono::Utc::now(),
+        };
+
+        let plan = state.generate_action_plan(&decision, true);
+
+        assert!(
+            !plan.actions.is_empty(),
+            "action plan should list at least one action"
+        );
+        let action = &plan.actions[0];
+        assert_eq!(action.kind, ActionKind::Load);
+        assert!(action.is_foreground);
+        assert!(action.is_mutating);
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -1550,27 +1841,48 @@ async fn execute(
     Json(request): Json<InferenceRequest>,
 ) -> Result<Json<ExecuteResponse>, (StatusCode, String)> {
     let decision = state.decide(&request).await.map_err(internal_error)?;
-    let mut load_requested = false;
 
-    if let (Some(runtime_id), Some(model_id)) =
-        (&decision.selected_runtime, &decision.selected_model)
-    {
-        let adapter_type = state.runtime_adapter_type(&runtime_id.to_string());
-        let is_mock = adapter_type == Some("mock");
-        if is_mock || live_execution_enabled() {
-            if let Some(runtime) = state.runtimes.get(&runtime_id.to_string()) {
-                runtime.load_model(model_id).await.map_err(internal_error)?;
-                load_requested = true;
+    let dry_run = !live_execution_enabled();
+    let action_plan = state.generate_action_plan(&decision, dry_run);
+
+    let mut load_requested = false;
+    let mut action_results = Vec::new();
+
+    if !dry_run {
+        if let (Some(runtime_id), Some(model_id)) =
+            (&decision.selected_runtime, &decision.selected_model)
+        {
+            let adapter_type = state.runtime_adapter_type(&runtime_id.to_string());
+            let is_mock = adapter_type == Some("mock");
+            if is_mock {
+                if let Some(runtime) = state.runtimes.get(&runtime_id.to_string()) {
+                    match runtime.load_model(model_id).await {
+                        Ok(handle) => {
+                            load_requested = true;
+                            action_results
+                                .push(format!("Loaded {} (handle: {})", model_id, handle.id));
+                        }
+                        Err(e) => {
+                            action_results.push(format!("Load failed: {}", e));
+                        }
+                    }
+                }
             }
         }
     }
 
     Ok(Json(ExecuteResponse {
         decision,
+        action_plan,
         handoff: ExecuteHandoff {
             load_requested,
             full_inference_forwarded: false,
-            message: "v1 execute performs decision logging and model-load handoff only".to_string(),
+            message: if dry_run {
+                "v1 execute performs dry-run action plan and model-load handoff only"
+            } else {
+                "v1 execute performs decision logging and model-load handoff only"
+            }
+            .to_string(),
         },
     }))
 }
@@ -1578,6 +1890,7 @@ async fn execute(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteResponse {
     pub decision: Decision,
+    pub action_plan: ActionPlan,
     pub handoff: ExecuteHandoff,
 }
 
