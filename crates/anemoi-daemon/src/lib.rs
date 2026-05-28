@@ -257,7 +257,7 @@ impl StagingWorker {
 
     pub async fn execute_pending(&self, runtime: &DynRuntimeAdapter) -> anyhow::Result<()> {
         let pending = self.get_pending().await;
-        for mut intent in pending {
+        for intent in pending {
             match runtime.load_model(&intent.background_model).await {
                 Ok(_) => {
                     self.update_state(intent.id, StagingState::Completed, None)
@@ -1247,7 +1247,7 @@ mod tests {
         let mock_runtime = state.runtimes.get("mock").expect("mock runtime");
 
         staging_worker
-            .execute_pending(&mock_runtime)
+            .execute_pending(mock_runtime)
             .await
             .expect("execute should succeed");
 
