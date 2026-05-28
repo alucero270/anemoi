@@ -1,138 +1,51 @@
 # Anemoi
 
-Anemoi is a local-first inference governance daemon for heterogeneous AI
-systems.
+Anemoi is a local-first inference governance layer for heterogeneous AI systems.
 
 ```text
 Anemoi decides.
 Runtimes execute.
 ```
 
-The Rust rewrite focuses on residency-aware decision making before
-provider-gateway behavior. The first version inspects runtime state, evaluates
-policy, chooses an execution path, and records a structured explanation.
-
-## Status
-
-| Field | Value |
-|---|---|
-| Project shape | Local inference governance daemon |
-| Language | Rust |
-| Core behavior | Runtime inspection, residency scoring, continuity decisions |
-| API surface | Axum daemon |
-| CLI surface | `anemoi` |
-| MCP surface | Minimum local control-plane adapter |
-| Config | `config/anemoi.example.yaml` |
-| Decision log | In-memory by default; optional append-only JSONL |
-| Live inference forwarding | Partial; full forwarding is deferred |
-| Provider gateway behavior | Out of core v1 |
-
-## Current Repository State
-
-Repository evidence as of 2026-05-24:
-
-| Item | Current state |
-|---|---|
-| Rust workspace | `Cargo.toml` with `crates/anemoi-*` members |
-| Example config | `config/anemoi.example.yaml` |
-| Legacy files | `src/Anemoi.*` and `Anemoi.sln` are still present |
-| Legacy status | `Needs validation` |
-
-Do not treat the legacy .NET surface as removed or migrated. Deletion,
-migration, or compatibility work needs explicit scope.
+Anemoi provides runtime selection, residency governance, and continuity preservation to ensure deterministic scheduling and transparent decision-making. It ensures that the most efficient execution path is chosen based on residency states, budget constraints, and policy scoring.
 
 ## Product Boundary
 
-Anemoi owns:
+Anemoi owns the decision logic:
+- Request-to-domain-to-roster-to-residency-group scheduling.
+- Model residency state normalization (`cold`, `loading`, `warm_cpu`, `partial`, `hot_gpu`, `serving`, `draining`, `evicting`, `failed`).
+- Runtime inspection through adapters.
+- Policy scoring and continuity fallback.
+- Decision telemetry and structured explanations.
 
-- Runtime selection.
-- Residency governance.
-- Continuity preservation.
-- Execution economics.
-- Deterministic scheduling decisions.
-- Structured explanations.
-- Decision telemetry.
-
-Anemoi does not own:
-
-- Inference execution internals.
-- Model weights.
-- Agent planning.
-- Memory.
-- Retrieval.
-- Training.
-- Tool orchestration.
-- Provider gateway behavior in core v1.
+Anemoi is **not** an inference runtime, model host, provider gateway, or agent framework.
 
 ## System Position
 
 ```mermaid
 flowchart TD
     A["Chat / Agent"] --> B["Anemoi"]
-    B --> C["Execution substrate<br/>llama-swap / runtime adapter"]
-    C --> D["Runtime<br/>llama.cpp / Ollama / vLLM"]
+    B --> C["Execution substrate / Runtime adapter"]
+    C --> D["Runtime (llama.cpp / Ollama / vLLM)"]
     D --> E["Model"]
-```
-
-Optional future stack:
-
-```mermaid
-flowchart TD
-    A["Chat"] --> B["Anemoi ingress gate"]
-    B --> C["Machina<br/>agent runtime"]
-    C --> D["Memora<br/>context / memory"]
-    D --> E["Anemoi execution governor"]
-    E --> F["Runtime"]
 ```
 
 ## Scheduling Model
 
-Anemoi schedules against residency groups, not raw model names.
-
-```mermaid
-flowchart TD
-    A["Request"] --> B["Domain"]
-    B --> C["Roster"]
-    C --> D["Residency group"]
-    D --> E["Profile"]
-    E --> F["Runtime"]
-```
-
-The scheduler pipeline:
-
-```mermaid
-flowchart TD
-    A["Request"] --> B["Budget inspection"]
-    B --> C["Domain lookup"]
-    C --> D["Roster lookup"]
-    D --> E["Residency group lookup"]
-    E --> F["Runtime inspection"]
-    F --> G["Candidate generation"]
-    G --> H["Policy scoring"]
-    H --> I{"Decision"}
-    I --> J["Reuse"]
-    I --> K["Load"]
-    I --> L["Deny"]
-    I --> M["Stage"]
-    J --> N["Execution handoff"]
-    K --> N
-    M --> N
-    L --> O["Explanation"]
-    N --> P["Telemetry"]
-    P --> O
-```
+Anemoi schedules against residency groups, not raw model names:
+`Request` $\to$ `Domain` $\to$ `Roster` $\to$ `Residency Group` $\to$ `Profile` $\to$ `Runtime`
 
 ## Workspace
 
 | Crate | Responsibility |
 |---|---|
-| `crates/anemoi-core` | Shared domain types, config, residency states, decisions, explanations. |
-| `crates/anemoi-runtime` | Runtime adapter trait, mock adapter, Ollama inspect adapter, llama-swap inspection adapter, and HTTP inspect stubs for llama.cpp. |
-| `crates/anemoi-policy` | Deterministic scheduler, scoring, continuity fallback behavior. |
-| `crates/anemoi-telemetry` | Recent in-memory decisions and optional append-only JSONL logging. |
-| `crates/anemoi-daemon` | Axum control-plane API. |
-| `crates/anemoi-cli` | `anemoi status`, `anemoi decide`, `anemoi explain`, `anemoi residents`, `anemoi runtimes`, `anemoi policy check`. |
-| `crates/anemoi-mcp` | Minimum MCP-facing adapter for status, residents, decide, explain, and policy check. |
+| `anemoi-core` | Domain types, config, residency states, decisions, explanations. |
+| `anemoi-runtime` | Runtime adapter trait and inspection adapters (Mock, LlamaSwap, Ollama, LlamaCpp). |
+| `anemoi-policy` | Deterministic scheduling, scoring, and continuity behavior. |
+| `anemoi-telemetry` | Decision logs and runtime/event telemetry. |
+| `anemoi-daemon` | Axum local control-plane API. |
+| `anemoi-cli` | Operator commands (`status`, `decide`, `explain`, `residents`). |
+| `anemoi-mcp` | MCP control-plane adapter. |
 
 ## API
 
@@ -142,106 +55,41 @@ flowchart TD
 | `GET /status` | Runtime and policy summary. |
 | `GET /residents` | Current normalized residency view. |
 | `POST /decide` | Return a decision without executing inference. |
-| `POST /execute` | Decide, record the decision, and return an explicit model-load handoff response. |
+| `POST /execute` | Decide, record, and return a model-load handoff response. |
 | `GET /decisions/:id` | Fetch a recorded decision. |
 | `GET /explain/:id` | Fetch the explanation for a recorded decision. |
-| `GET /openapi.json` | Fetch the OpenAPI contract. |
 
-Full inference forwarding belongs to a later runtime-adapter pass. In v1,
-`/execute` reports `full_inference_forwarded: false`.
+## Configuration & Execution
 
-## Configuration
+Default config: `config/anemoi.example.yaml`
 
-Default config path:
-
-```text
-config/anemoi.example.yaml
-```
-
-Override at runtime:
-
-```powershell
-$env:ANEMOI_CONFIG = "config/anemoi.example.yaml"
-$env:ANEMOI_BIND = "127.0.0.1:7070"
-$env:ANEMOI_DECISION_LOG = "logs/anemoi-decisions.jsonl"
-```
-
-Phase one does not require a database. Recent decisions are kept in process
-memory. Set `ANEMOI_DECISION_LOG` only when an append-only JSONL trail is useful.
-`/explain/:id` and `/decisions/:id` can only find recent in-memory decisions;
-JSONL replay is deferred.
-
-The example config defines:
-
-- a `coding` domain
-- `small_swarm` and `large_models` residency groups
-- mock runtime-backed model profiles
-- a hot `qwen9b` mock resident for the continuity demo
-- continuity policy that prefers degraded response over blank waits
-
-## Run
-
-Start the daemon:
-
+**Start the daemon:**
 ```powershell
 cargo run -p anemoi-daemon
 ```
 
-Run CLI commands:
-
+**Run CLI commands:**
 ```powershell
 cargo run -p anemoi-cli -- status
-cargo run -p anemoi-cli -- decide --domain coding --latency-budget-ms 1500
 cargo run -p anemoi-cli -- residents
-cargo run -p anemoi-cli -- runtimes
-cargo run -p anemoi-cli -- policy check
+cargo run -p anemoi-cli -- decide --domain coding --latency-budget-ms 1500
 ```
 
-OpenAPI:
-
-```powershell
-curl http://127.0.0.1:7070/openapi.json
-```
-
-## Test
+## Development & Validation
 
 ```powershell
 cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The core proof test verifies the first continuity behavior: when a large model
-would cold-load and a smaller worker is already hot, Anemoi selects the hot
-worker and records the larger model as a background stage target.
+## Repository State
 
-## First Proof Of Value
-
-The first useful Anemoi behavior is not routing a prompt.
-
-The first useful behavior is:
-
-```text
-Anemoi avoided loading a large cold model,
-reused a hot acceptable worker,
-kept interaction responsive,
-staged the larger model only when policy allowed,
-and explained the decision.
-```
-
-## Explicit Deferrals
-
-- Full inference forwarding.
-- Cloud API routing.
-- Provider gateway behavior.
-- Agent planning.
-- Memory or RAG behavior.
-- Multi-node scheduling.
-- Legacy .NET deletion or migration.
-- SQLite and database-backed analytics.
+- **Rust Workspace**: Active in `crates/anemoi-*`.
+- **Legacy Surface**: `.NET`/C# files in `src/Anemoi.*` and `Anemoi.sln` are present and marked as `Needs validation`.
+- **Local-First**: By default, services bind to loopback.
 
 ## References
-
 - `AGENTS.md`
 - `CONTRIBUTING.md`
 - `config/anemoi.example.yaml`
-- `docs/handoff.md`
 - `docs/test_roadmap.md`
