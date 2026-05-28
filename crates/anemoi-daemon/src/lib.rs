@@ -10,12 +10,137 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
+
+const DEFAULT_RECONCILIATION_TTL_MS: u64 = 5000;
+
+#[derive(Debug, Clone)]
+pub struct ReconciledSnapshot {
+    pub snapshot: RuntimeSnapshot,
+    pub last_inspected: DateTime<Utc>,
+    pub last_error: Option<String>,
+    pub is_stale: bool,
+}
+
+impl ReconciledSnapshot {
+    pub fn fresh(snapshot: RuntimeSnapshot) -> Self {
+        Self {
+            snapshot,
+            last_inspected: Utc::now(),
+            last_error: None,
+            is_stale: false,
+        }
+    }
+
+    pub fn stale(snapshot: RuntimeSnapshot, last_error: Option<String>) -> Self {
+        Self {
+            snapshot,
+            last_inspected: Utc::now(),
+            last_error,
+            is_stale: true,
+        }
+    }
+
+    pub fn from_error(runtime_id: RuntimeId, error: String) -> Self {
+        let snapshot = RuntimeSnapshot {
+            runtime_id,
+            available: false,
+            residents: Vec::new(),
+            memory: anemoi_core::RuntimeMemorySnapshot::default(),
+            active_requests: Vec::new(),
+        };
+        Self {
+            snapshot,
+            last_inspected: Utc::now(),
+            last_error: Some(error),
+            is_stale: true,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Reconciler {
+    cache: Arc<RwLock<HashMap<String, ReconciledSnapshot>>>,
+    ttl_ms: u64,
+}
+
+impl Reconciler {
+    pub fn new(ttl_ms: u64) -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            ttl_ms,
+        }
+    }
+
+    pub async fn update(&self, runtime_id: &str, snapshot: RuntimeSnapshot) {
+        let mut cache = self.cache.write().await;
+        cache.insert(runtime_id.to_string(), ReconciledSnapshot::fresh(snapshot));
+    }
+
+    pub async fn record_error(&self, runtime_id: &str, error: String) {
+        let mut cache = self.cache.write().await;
+        let runtime_id_obj = RuntimeId(runtime_id.to_string());
+        cache.insert(
+            runtime_id.to_string(),
+            ReconciledSnapshot::from_error(runtime_id_obj, error),
+        );
+    }
+
+    pub async fn mark_stale(&self) {
+        let mut cache = self.cache.write().await;
+        for (_, reconciled) in cache.iter_mut() {
+            reconciled.is_stale = true;
+        }
+    }
+
+    pub async fn get(&self, runtime_id: &str) -> Option<ReconciledSnapshot> {
+        let cache = self.cache.read().await;
+        let mut reconciled = cache.get(runtime_id).cloned();
+        if let Some(ref mut r) = reconciled {
+            let elapsed = Utc::now()
+                .signed_duration_since(r.last_inspected)
+                .num_milliseconds();
+            r.is_stale = elapsed > self.ttl_ms as i64;
+        }
+        reconciled
+    }
+
+    pub async fn all(&self) -> Vec<ReconciledSnapshot> {
+        let cache = self.cache.read().await;
+        cache
+            .values()
+            .map(|r| {
+                let mut r = r.clone();
+                let elapsed = Utc::now()
+                    .signed_duration_since(r.last_inspected)
+                    .num_milliseconds();
+                r.is_stale = elapsed > self.ttl_ms as i64;
+                r
+            })
+            .collect()
+    }
+
+    pub async fn get_snapshots(&self) -> Vec<RuntimeSnapshot> {
+        self.all().await.into_iter().map(|r| r.snapshot).collect()
+    }
+
+    pub async fn has_cache(&self) -> bool {
+        !self.cache.read().await.is_empty()
+    }
+}
+
+impl Default for Reconciler {
+    fn default() -> Self {
+        Self::new(DEFAULT_RECONCILIATION_TTL_MS)
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -23,6 +148,7 @@ pub struct AppState {
     scheduler: Scheduler,
     runtimes: HashMap<String, DynRuntimeAdapter>,
     decision_log: DynDecisionLog,
+    reconciler: Reconciler,
 }
 
 impl AppState {
@@ -76,11 +202,14 @@ impl AppState {
             runtimes.insert(runtime_id.to_string(), adapter);
         }
 
+        let reconciler = Reconciler::default();
+
         Ok(Self {
             config,
             scheduler,
             runtimes,
             decision_log,
+            reconciler,
         })
     }
 
@@ -112,12 +241,19 @@ impl AppState {
             runtimes.insert(runtime_id.to_string(), adapter);
         }
 
+        let reconciler = Reconciler::default();
+
         Ok(Self {
             config,
             scheduler,
             runtimes,
             decision_log: Arc::new(InMemoryDecisionLog::default()),
+            reconciler,
         })
+    }
+
+    pub fn reconciler(&self) -> Reconciler {
+        self.reconciler.clone()
     }
 
     pub async fn snapshots(&self) -> Vec<RuntimeSnapshot> {
@@ -131,7 +267,12 @@ impl AppState {
     }
 
     pub async fn decide(&self, request: &InferenceRequest) -> anyhow::Result<Decision> {
-        let snapshots = self.snapshots().await;
+        let has_cache = self.reconciler.has_cache().await;
+        let snapshots = if has_cache {
+            self.reconciler.get_snapshots().await
+        } else {
+            self.snapshots().await
+        };
         let decision = self.scheduler.decide(request, &snapshots)?;
         self.decision_log.record_decision(&decision).await?;
         Ok(decision)
@@ -142,6 +283,21 @@ impl AppState {
             .runtimes
             .get(&RuntimeId(runtime_id.to_string()))
             .map(|config| config.adapter.as_str())
+    }
+
+    pub async fn run_reconciliation_tick(&self) {
+        for (runtime_id, adapter) in &self.runtimes {
+            match adapter.inspect().await {
+                Ok(snapshot) => {
+                    self.reconciler.update(runtime_id, snapshot).await;
+                }
+                Err(e) => {
+                    self.reconciler
+                        .record_error(runtime_id, e.to_string())
+                        .await;
+                }
+            }
+        }
     }
 }
 
@@ -622,6 +778,105 @@ mod tests {
             .join("anemoi.example.yaml");
         AnemoiConfig::from_yaml_file(config_path).expect("example config")
     }
+
+    #[tokio::test]
+    async fn reconciliation_loop_updates_snapshot_cache_from_runtime_inspect() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        state.run_reconciliation_tick().await;
+
+        let reconciler = state.reconciler();
+        let has_cache = reconciler.has_cache().await;
+        assert!(has_cache, "reconciler should have cache after tick");
+
+        let snapshots = reconciler.get_snapshots().await;
+        assert!(
+            !snapshots.is_empty(),
+            "should have at least one snapshot after tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_loop_marks_snapshot_stale_after_ttl() {
+        let reconciler = Reconciler::new(1);
+
+        let snapshot = RuntimeSnapshot {
+            runtime_id: RuntimeId("test".to_string()),
+            available: true,
+            residents: vec![],
+            memory: anemoi_core::RuntimeMemorySnapshot::default(),
+            active_requests: vec![],
+        };
+        reconciler.update("test", snapshot).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let stale = reconciler.get("test").await.expect("snapshot should exist");
+        assert!(
+            stale.is_stale,
+            "snapshot should be stale after TTL exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_loop_records_runtime_inspection_error_without_panicking() {
+        let reconciler = Reconciler::new(5000);
+
+        reconciler
+            .record_error("test_runtime", "connection refused".to_string())
+            .await;
+
+        let snapshot = reconciler.get("test_runtime").await;
+        assert!(snapshot.is_some(), "error record should exist in cache");
+        let snapshot = snapshot.unwrap();
+        assert!(snapshot.last_error.is_some(), "error should be recorded");
+        assert_eq!(snapshot.last_error.unwrap(), "connection refused");
+        assert!(
+            !snapshot.snapshot.available,
+            "snapshot should be marked unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_uses_reconciled_snapshot_when_available() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        state.run_reconciliation_tick().await;
+
+        let reconciler = state.reconciler();
+        assert!(
+            reconciler.has_cache().await,
+            "cache should exist after tick"
+        );
+
+        let snapshots = reconciler.get_snapshots().await;
+        assert!(
+            !snapshots.is_empty(),
+            "reconciled snapshots should be available"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_uses_reconciled_snapshot_without_reinspecting_when_fresh() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        state.run_reconciliation_tick().await;
+
+        let reconciler = state.reconciler();
+        assert!(
+            reconciler.has_cache().await,
+            "cache should exist after tick"
+        );
+
+        let decision = state.decide(&sample_request()).await.expect("decision");
+        assert!(
+            decision.selected_runtime.is_some(),
+            "decision should use reconciled snapshot"
+        );
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -918,7 +1173,13 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
 }
 
 async fn residents(State(state): State<AppState>) -> Json<Vec<RuntimeSnapshot>> {
-    Json(state.snapshots().await)
+    let has_cache = state.reconciler.has_cache().await;
+    let snapshots = if has_cache {
+        state.reconciler.get_snapshots().await
+    } else {
+        state.snapshots().await
+    };
+    Json(snapshots)
 }
 
 async fn decide(
