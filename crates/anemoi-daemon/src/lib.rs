@@ -973,6 +973,7 @@ mod tests {
                 ram_required_mb: None,
                 cold_load_estimate_ms: None,
                 supported_runtimes: vec![RuntimeId("live_target".to_string())],
+                supports_streaming: None,
             },
         );
 

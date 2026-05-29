@@ -30,6 +30,7 @@ models:
     vram_required_mb: 9000
     ram_required_mb: 12000
     cold_load_estimate_ms: 18000
+    supports_streaming: true
     supported_runtimes:
       - mock
 
@@ -40,6 +41,7 @@ models:
     vram_required_mb: 8000
     ram_required_mb: 10000
     cold_load_estimate_ms: 15000
+    supports_streaming: true
     supported_runtimes:
       - mock
 
@@ -50,6 +52,7 @@ models:
     vram_required_mb: 30000
     ram_required_mb: 45000
     cold_load_estimate_ms: 45000
+    supports_streaming: true
     supported_runtimes:
       - mock
 

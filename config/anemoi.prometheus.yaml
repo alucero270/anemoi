@@ -57,6 +57,7 @@ models:
     vram_required_mb: 7000
     ram_required_mb: 0
     cold_load_estimate_ms: 8000
+    supports_streaming: true
     supported_runtimes:
       - llama_swap
 
@@ -67,6 +68,7 @@ models:
     vram_required_mb: 6000
     ram_required_mb: 0
     cold_load_estimate_ms: 6000
+    supports_streaming: true
     supported_runtimes:
       - llama_swap
 
@@ -77,6 +79,7 @@ models:
     vram_required_mb: 12000
     ram_required_mb: 20000
     cold_load_estimate_ms: 30000
+    supports_streaming: true
     supported_runtimes:
       - llama_swap
 
@@ -87,6 +90,7 @@ models:
     vram_required_mb: 14000
     ram_required_mb: 16000
     cold_load_estimate_ms: 25000
+    supports_streaming: true
     supported_runtimes:
       - llama_swap
 
@@ -97,6 +101,7 @@ models:
     vram_required_mb: 8000
     ram_required_mb: 40000
     cold_load_estimate_ms: 60000
+    supports_streaming: true
     supported_runtimes:
       - llama_swap
 
@@ -107,6 +112,7 @@ models:
     vram_required_mb: 8000
     ram_required_mb: 80000
     cold_load_estimate_ms: 90000
+    supports_streaming: true
     supported_runtimes:
       - llama_swap
 
