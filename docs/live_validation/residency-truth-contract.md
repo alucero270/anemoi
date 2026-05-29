@@ -58,6 +58,11 @@ This ensures Anemoi is conservative: unknown means cold until proven otherwise.
 - `/v1/models` lists configured models but does **not** prove residency.
 - `inspect()` returns empty residents. Configured models remain `Cold`.
 - `inspect_models()` returns configured model IDs for reference, not residency.
+- The configured model list is surfaced on the snapshot as
+  `configured_models: Vec<ModelId>`. This is configuration evidence, not
+  residency evidence — policy may use it for candidate enumeration and
+  rejected-options reasoning, but it must not contribute a hot-reuse
+  bonus and it does not change the `Cold` residency state of any model.
 
 ### HttpInspectAdapter (llama.cpp / llama_server)
 - Health check confirms process is reachable.
