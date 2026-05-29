@@ -143,6 +143,9 @@ pub struct ResidencyGroup {
     pub models: Vec<ModelId>,
     pub keep_hot: bool,
     pub allow_background_load: bool,
+    /// Pinned groups are protected from eviction unless a force policy
+    /// explicitly overrides protection.
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,6 +314,18 @@ impl ActionPlan {
         });
     }
 
+    pub fn add_unload(&mut self, runtime_id: RuntimeId, model_id: ModelId, reason: String) {
+        self.actions.push(RuntimeAction {
+            kind: ActionKind::Unload,
+            runtime_id,
+            model_id: Some(model_id),
+            is_foreground: true,
+            is_mutating: true,
+            reason,
+            expected_cost_ms: None,
+        });
+    }
+
     pub fn add_noop(&mut self, runtime_id: RuntimeId, reason: String) {
         self.actions.push(RuntimeAction {
             kind: ActionKind::NoOp,
@@ -462,6 +477,8 @@ pub struct ResidencyGroupConfig {
     pub keep_hot: bool,
     #[serde(default)]
     pub allow_background_load: bool,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl ResidencyGroupConfig {
@@ -472,6 +489,7 @@ impl ResidencyGroupConfig {
             models: self.models,
             keep_hot: self.keep_hot,
             allow_background_load: self.allow_background_load,
+            pinned: self.pinned,
         }
     }
 }
@@ -526,6 +544,11 @@ impl AnemoiConfig {
     pub fn from_yaml_file_raw(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path)?;
         Ok(serde_yaml::from_str(&text)?)
+    }
+
+    pub fn from_yaml_str(text: &str) -> Result<Self, ConfigError> {
+        let expanded = expand_env_vars(text);
+        Ok(serde_yaml::from_str(&expanded)?)
     }
 
     pub fn validate(&self) -> Result<(), ConfigValidationError> {

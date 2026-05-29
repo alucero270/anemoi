@@ -1,8 +1,8 @@
 use anemoi_core::{
     ActionKind, ActionPlan, AnemoiConfig, Decision, DecisionAction, InferenceRequest, ModelId,
-    ModelResident, RuntimeId, RuntimeSnapshot,
+    ModelResident, ResidencyState, RuntimeId, RuntimeSnapshot,
 };
-use anemoi_policy::Scheduler;
+use anemoi_policy::{EvictionCandidateResident, EvictionPlan, EvictionRequest, Scheduler};
 use anemoi_runtime::{
     DynRuntimeAdapter, LlamaCppAdapter, LlamaSwapAdapter, MockRuntimeAdapter, OllamaAdapter,
 };
@@ -579,6 +579,95 @@ impl AppState {
                         }
                     }
                 }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Build an eviction plan from the reconciled cache and configured policy.
+    /// Pure read of governance state — never mutates a runtime.
+    pub async fn plan_evictions(&self, force: bool) -> EvictionPlan {
+        let snapshots = self.reconciler.get_snapshots().await;
+        let now = chrono::Utc::now();
+
+        let mut residents = Vec::new();
+        for snapshot in &snapshots {
+            for resident in &snapshot.residents {
+                let (keep_hot, pinned) = self.group_protection(&resident.model_id);
+                let serving = snapshot
+                    .active_requests
+                    .iter()
+                    .any(|active| active.model_id == resident.model_id);
+                let state = if serving {
+                    ResidencyState::Serving
+                } else {
+                    resident.state.clone()
+                };
+                let idle_secs = resident
+                    .loaded_since
+                    .map(|since| (now - since).num_seconds().max(0) as u64);
+                residents.push(EvictionCandidateResident {
+                    model_id: resident.model_id.clone(),
+                    runtime_id: snapshot.runtime_id.clone(),
+                    state,
+                    keep_hot,
+                    pinned,
+                    idle_secs,
+                });
+            }
+        }
+
+        anemoi_policy::plan_evictions(&EvictionRequest {
+            residents: &residents,
+            force,
+        })
+    }
+
+    fn group_protection(&self, model_id: &ModelId) -> (bool, bool) {
+        let mut keep_hot = false;
+        let mut pinned = false;
+        for group in self.config.residency_groups.values() {
+            if group.models.contains(model_id) {
+                keep_hot |= group.keep_hot;
+                pinned |= group.pinned;
+            }
+        }
+        (keep_hot, pinned)
+    }
+
+    /// Execute the unload actions in an eviction plan. Mock runtimes execute
+    /// when the plan is approved; non-mock runtimes additionally require
+    /// `ANEMOI_ENABLE_LIVE_EXECUTE=1`. Dry-run or unapproved plans do nothing.
+    pub async fn execute_eviction_plan(
+        &self,
+        plan: &ActionPlan,
+        approved: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut results = Vec::new();
+
+        if plan.dry_run || !approved {
+            return Ok(results);
+        }
+
+        for action in &plan.actions {
+            if action.kind != ActionKind::Unload {
+                continue;
+            }
+            let Some(model_id) = &action.model_id else {
+                continue;
+            };
+
+            let is_mock = self.runtime_adapter_type(&action.runtime_id.to_string()) == Some("mock");
+            if !is_mock && !live_execution_enabled() {
+                return Err(anyhow::anyhow!(
+                    "Live eviction requires ANEMOI_ENABLE_LIVE_EXECUTE=1"
+                ));
+            }
+
+            if let Some(runtime) = self.runtimes.get(&action.runtime_id.to_string()) {
+                runtime.unload_model(model_id).await?;
+                results.push(format!("Unloaded {} on {}", model_id, action.runtime_id));
             }
         }
 
@@ -1514,6 +1603,90 @@ mod tests {
         assert!(
             result.is_err(),
             "live execution should fail without ANEMOI_ENABLE_LIVE_EXECUTE=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_eviction_executes_unload_action_when_plan_is_approved() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        // The example mock runtime starts with qwen9b resident.
+        let before = state.snapshots().await;
+        assert!(
+            before.iter().any(|snapshot| snapshot
+                .residents
+                .iter()
+                .any(|resident| resident.model_id == ModelId("qwen9b".to_string()))),
+            "qwen9b should be resident before eviction"
+        );
+
+        let mut plan = ActionPlan::new(Uuid::new_v4(), false);
+        plan.add_unload(
+            RuntimeId("mock".to_string()),
+            ModelId("qwen9b".to_string()),
+            "approved eviction".to_string(),
+        );
+
+        let results = state
+            .execute_eviction_plan(&plan, true)
+            .await
+            .expect("mock eviction should execute");
+        assert!(
+            results.iter().any(|line| line.contains("qwen9b")),
+            "eviction result should report unloading qwen9b"
+        );
+
+        let after = state.snapshots().await;
+        assert!(
+            !after.iter().any(|snapshot| snapshot
+                .residents
+                .iter()
+                .any(|resident| resident.model_id == ModelId("qwen9b".to_string()))),
+            "qwen9b should no longer be resident after approved mock eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_eviction_requires_explicit_enable_flag() {
+        let config = AnemoiConfig::from_yaml_str(
+            r#"
+domains:
+  coding:
+    rosters: [pool]
+residency_groups:
+  pool:
+    models: [qwen9b]
+models:
+  qwen9b:
+    family: qwen
+    parameter_class: 9b
+    context_window: 32768
+    vram_required_mb: 9000
+    ram_required_mb: 12000
+    cold_load_estimate_ms: 18000
+    supported_runtimes: [live]
+runtimes:
+  live:
+    adapter: ollama
+    base_url: http://127.0.0.1:11434
+"#,
+        )
+        .expect("valid config");
+
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+
+        let mut plan = ActionPlan::new(Uuid::new_v4(), false);
+        plan.add_unload(
+            RuntimeId("live".to_string()),
+            ModelId("qwen9b".to_string()),
+            "operator eviction".to_string(),
+        );
+
+        let result = state.execute_eviction_plan(&plan, true).await;
+        assert!(
+            result.is_err(),
+            "live (non-mock) eviction must fail without ANEMOI_ENABLE_LIVE_EXECUTE=1"
         );
     }
 
