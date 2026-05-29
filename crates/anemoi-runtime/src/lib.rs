@@ -373,6 +373,22 @@ impl RuntimeAdapter for LlamaSwapAdapter {
     }
 
     async fn load_model(&self, model: &ModelId) -> Result<LoadHandle, RuntimeError> {
+        let url = self
+            .base_url
+            .join("/v1/chat/completions")
+            .map_err(|error| RuntimeError::Url(error.to_string()))?;
+        let body = serde_json::json!({
+            "model": model.to_string(),
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+        });
+        self.client
+            .post(url)
+            .headers(self.headers()?)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(LoadHandle {
             id: Uuid::new_v4(),
             model_id: model.clone(),
@@ -893,6 +909,50 @@ mod tests {
 
         assert_eq!(snapshot.residents.len(), 1);
         assert_eq!(snapshot.residents[0].state, ResidencyState::HotGpu);
+    }
+
+    #[tokio::test]
+    async fn llama_swap_load_model_posts_to_chat_completions() {
+        let server = spawn_fixture(vec![http_response(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )])
+        .await;
+        let adapter = LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let handle = adapter
+            .load_model(&ModelId("qwen9b".to_string()))
+            .await
+            .expect("load handle");
+
+        assert_eq!(handle.model_id, ModelId("qwen9b".to_string()));
+
+        let requests = server.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(
+            request.starts_with("POST /v1/chat/completions"),
+            "load_model must POST to /v1/chat/completions, got: {request:?}"
+        );
+        assert!(
+            request.contains("\"model\":\"qwen9b\""),
+            "request must carry the requested model id, got: {request:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn llama_swap_load_model_surfaces_upstream_5xx_as_error() {
+        let server = spawn_fixture(vec![http_response(500, "{}")]).await;
+        let adapter = LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let error = adapter
+            .load_model(&ModelId("qwen9b".to_string()))
+            .await
+            .expect_err("upstream 5xx must surface as error");
+
+        assert!(matches!(error, RuntimeError::Http(_)));
     }
 
     #[tokio::test]
