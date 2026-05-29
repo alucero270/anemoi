@@ -222,6 +222,43 @@ Required early coverage:
 Core policy tests should be single-purpose: one rule, one behavior, one reason
 to fail.
 
+### Tests Must Observe Behavior
+
+Green `fmt`, `test`, and `clippy` measure shape, not behavior. A change can pass
+all three and still deliver nothing. These rules close that gap and are the
+definition of done for any prompt that claims a working feature.
+
+- **Assert the observed value, not that a call returned.** `assert!(x.is_ok())`
+  or `assert!(x.is_some())` as the only assertion is not a passing test — it
+  cannot tell a working implementation from a broken one. Record something, read
+  it back, and `assert_eq!` the value you expected. Negative assertions
+  (`is_err`, `is_none`) are allowed when refusal or absence *is* the behavior
+  under test (for example, a safety gate that must deny).
+- **Durability requires a restart round-trip.** A claim that data survives
+  restart is proven only by writing through one store instance, dropping it, and
+  opening a *fresh* instance over the same file or URL to read the value back. A
+  test that reads from an in-memory cache held by the same instance proves
+  nothing about durability.
+- **The feature must be reachable from the real binary.** If the only caller of
+  a new code path is a `#[cfg(test)]` helper, the feature does not exist for
+  operators. Wire it into the daemon or CLI entry point and prove it through that
+  entry point. Production code never lives behind a public test-only function.
+- **External issue schemas are checklists.** When a prompt references an issue
+  that defines a schema (for example issue #12 `resident_events`), every required
+  column or field must exist and be exercised by a test that reads it back. A
+  schema that is documented but not populated and queried is incomplete.
+- **Grade before landing.** Before flipping a roadmap row to `Passing`, re-read
+  the acceptance criteria and confirm each one is met by a behavioral test, not
+  by the gates being green. If you cannot point to the test that would fail if
+  the feature regressed, the feature is not done.
+
+`anemoi-guard` (run in CI) enforces the mechanically checkable subset of the
+above: no `pub fn` inside a `#[cfg(test)]` module, and no test whose only
+assertion is `is_ok`/`is_some`. Suppress a genuinely intentional exception with a
+comment containing `anemoi-guard:allow` and a one-line reason. Reaching for the
+escape hatch instead of asserting a value is a code smell — prefer the real
+assertion.
+
 ---
 
 ## 12. Validation Expectations
@@ -232,6 +269,7 @@ For Rust changes, run the strongest applicable checks:
 cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo run -p anemoi-guard -- crates
 ```
 
 If Rust tooling is unavailable, report that explicitly.
