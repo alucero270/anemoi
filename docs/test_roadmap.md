@@ -47,7 +47,7 @@ hardening when the local toolchain has the `clippy` component installed.
 | 24 resource pressure model | Candidate scoring uses explicit VRAM, RAM, KV, load, and active-request pressure evidence. | `anemoi-policy`, `anemoi-core` | Passing |
 | 25 eviction and pinning policy | Keep-hot workers are protected and eviction plans are explainable and gated. | `anemoi-policy`, `anemoi-core`, `anemoi-runtime` | Passing |
 | 26 operator status surface | Status and CLI output show runtime health, residents, staging, policy, and unknown/stale state. | `anemoi-daemon`, `anemoi-cli` | Passing |
-| 27 durable event store | Optional SQLite history records decisions, snapshots, staging, action plans, and explanations. | `anemoi-telemetry`, `anemoi-daemon` | Pending |
+| 27 durable event store | Optional SQLite history records decisions, snapshots, staging, action plans, and explanations. | `anemoi-telemetry`, `anemoi-daemon` | Passing |
 | 28 inference forwarding gateway | `POST /v1/chat/completions` maps model field to domain, runs decide, forwards to selected runtime, streams response. | `anemoi-daemon`, `anemoi-runtime`, `anemoi-core` | Pending |
 
 ## Current Focus
@@ -245,3 +245,21 @@ Prompt 20 passed with:
 - `ANEMOI_ENABLE_LIVE_EXECUTE=1` opt-in guard for non-mock execution
 - `docs/live_validation/controlled-execution-gate.md` with approval checklist
   and execution path table
+
+Prompt 27 passed with:
+
+- `sqlite_event_store_records_decision_event`
+- `sqlite_event_store_records_runtime_snapshot_event`
+- `sqlite_event_store_records_staging_event`
+- `sqlite_event_store_records_action_plan_event`
+- `sqlite_event_store_replays_decision_explanation_by_id`
+- `daemon_starts_with_memory_store_when_database_url_is_missing`
+- `daemon_uses_sqlite_store_when_database_url_is_present`
+- `sqlite_event_store_records_resident_event` (issue #12 `resident_events`)
+
+SQLite is the source of truth: `get_decision`/`list_decisions` read from the
+database, so every required test reopens the file (a process "restart") and
+asserts the recorded value round-trips, rather than asserting `is_ok`. The
+`resident_events` table follows the issue #12 schema with a NOT NULL
+`evidence_source`. `execution_events`/`policy_events` tables are deferred: no
+required test exercises them and they belong to later prompts (21-23).
