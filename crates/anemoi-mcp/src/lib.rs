@@ -131,10 +131,9 @@ mod tests {
         let decision = service.decide(sample_request()).await.expect("decision");
         let json = serde_json::to_value(&decision).expect("decision json");
 
-        assert!(json.get("action").is_some());
-        assert!(json.get("selected_model").is_some());
-        assert!(json.get("score").is_some());
-        assert!(json.get("explanation").is_some());
+        let roundtrip: anemoi_core::Decision =
+            serde_json::from_value(json).expect("decision deserializes from its json shape");
+        assert_eq!(roundtrip, decision);
     }
 
     #[test]
