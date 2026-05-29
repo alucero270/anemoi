@@ -434,12 +434,10 @@ impl AppState {
     }
 
     pub async fn decide(&self, request: &InferenceRequest) -> anyhow::Result<Decision> {
-        let has_cache = self.reconciler.has_cache().await;
-        let snapshots = if has_cache {
-            self.reconciler.get_snapshots().await
-        } else {
-            self.snapshots().await
-        };
+        if !self.reconciler.has_cache().await {
+            self.run_reconciliation_tick().await;
+        }
+        let snapshots = self.reconciler.get_snapshots().await;
         let decision = self.scheduler.decide(request, &snapshots)?;
 
         if decision.action == DecisionAction::StageBackground {
@@ -1641,6 +1639,71 @@ mod tests {
             still_pending.len(),
             1,
             "non-mock staging intent should stay pending without ANEMOI_ENABLE_LIVE_EXECUTE"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_burst_reads_reconciler_cache_not_runtime_inspect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingAdapter {
+            inner: DynRuntimeAdapter,
+            inspects: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl anemoi_runtime::RuntimeAdapter for CountingAdapter {
+            fn id(&self) -> RuntimeId {
+                self.inner.id()
+            }
+            async fn inspect(&self) -> Result<RuntimeSnapshot, anemoi_runtime::RuntimeError> {
+                self.inspects.fetch_add(1, Ordering::SeqCst);
+                self.inner.inspect().await
+            }
+            async fn load_model(
+                &self,
+                model: &ModelId,
+            ) -> Result<anemoi_runtime::LoadHandle, anemoi_runtime::RuntimeError> {
+                self.inner.load_model(model).await
+            }
+            async fn unload_model(
+                &self,
+                model: &ModelId,
+            ) -> Result<(), anemoi_runtime::RuntimeError> {
+                self.inner.unload_model(model).await
+            }
+            async fn execute(
+                &self,
+                request: anemoi_core::ExecutionRequest,
+            ) -> Result<anemoi_runtime::ExecutionHandle, anemoi_runtime::RuntimeError> {
+                self.inner.execute(request).await
+            }
+        }
+
+        let mut state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+        let inspects = Arc::new(AtomicUsize::new(0));
+        let original = state
+            .runtimes
+            .get("mock")
+            .expect("mock runtime present")
+            .clone();
+        state.runtimes.insert(
+            "mock".to_string(),
+            Arc::new(CountingAdapter {
+                inner: original,
+                inspects: inspects.clone(),
+            }),
+        );
+
+        for _ in 0..8 {
+            state.decide(&sample_request()).await.expect("decision");
+        }
+
+        let total = inspects.load(Ordering::SeqCst);
+        assert_eq!(
+            total, 1,
+            "decide burst must reuse the reconciler cache; got {total} inspects"
         );
     }
 }
