@@ -649,6 +649,7 @@ continuity:
                 kv_cache_mb: None,
                 loaded_since: None,
             }],
+            configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
         };
@@ -703,6 +704,7 @@ continuity:
             runtime_id: RuntimeId("llama_swap".to_string()),
             available: true,
             residents: Vec::new(),
+            configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
         };
@@ -731,6 +733,7 @@ continuity:
             runtime_id: RuntimeId("llama_swap".to_string()),
             available: true,
             residents: Vec::new(),
+            configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
         };
@@ -771,6 +774,7 @@ continuity:
             runtime_id: RuntimeId("mock".to_string()),
             available: true,
             residents: Vec::new(),
+            configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
         };
@@ -863,6 +867,7 @@ continuity:
                 kv_cache_mb: None,
                 loaded_since: None,
             }],
+            configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
         }

@@ -55,6 +55,7 @@ impl ReconciledSnapshot {
             runtime_id,
             available: false,
             residents: Vec::new(),
+            configured_models: Vec::new(),
             memory: anemoi_core::RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
         };
@@ -1129,6 +1130,7 @@ mod tests {
             runtime_id: RuntimeId("test".to_string()),
             available: true,
             residents: vec![],
+            configured_models: Vec::new(),
             memory: anemoi_core::RuntimeMemorySnapshot::default(),
             active_requests: vec![],
         };

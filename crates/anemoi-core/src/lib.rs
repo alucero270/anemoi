@@ -146,6 +146,13 @@ pub struct RuntimeSnapshot {
     pub runtime_id: RuntimeId,
     pub available: bool,
     pub residents: Vec<ModelResident>,
+    /// Models the runtime reports as configured/registered (e.g. listed by
+    /// `/v1/models`). Configuration is not evidence of residency — see
+    /// `docs/live_validation/residency-truth-contract.md`. Use this for
+    /// candidate enumeration and rejected-options reasoning, not for hot
+    /// reuse bonuses.
+    #[serde(default)]
+    pub configured_models: Vec<ModelId>,
     pub memory: RuntimeMemorySnapshot,
     pub active_requests: Vec<ActiveExecution>,
 }

@@ -64,6 +64,7 @@ impl MockRuntimeAdapter {
                 runtime_id: id,
                 available: true,
                 residents,
+                configured_models: Vec::new(),
                 memory: RuntimeMemorySnapshot::default(),
                 active_requests: Vec::new(),
             })),
@@ -208,6 +209,7 @@ impl RuntimeAdapter for OllamaAdapter {
                 runtime_id: self.id.clone(),
                 available: false,
                 residents: Vec::new(),
+                configured_models: Vec::new(),
                 memory: RuntimeMemorySnapshot::default(),
                 active_requests: Vec::new(),
             });
@@ -231,6 +233,7 @@ impl RuntimeAdapter for OllamaAdapter {
             runtime_id: self.id.clone(),
             available: true,
             residents,
+            configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
         })
@@ -354,19 +357,22 @@ impl RuntimeAdapter for LlamaSwapAdapter {
                 runtime_id: self.id.clone(),
                 available: false,
                 residents: Vec::new(),
+                configured_models: Vec::new(),
                 memory: RuntimeMemorySnapshot::default(),
                 active_requests: Vec::new(),
             });
         }
 
-        let _models = self.inspect_models().await?;
+        let configured_models = self.inspect_models().await?;
 
         Ok(RuntimeSnapshot {
             runtime_id: self.id.clone(),
             available: true,
-            // Needs validation: llama-swap /v1/models proves configured models,
-            // not currently resident/running models.
+            // /v1/models proves configuration, not residency — see
+            // docs/live_validation/residency-truth-contract.md. residents stays
+            // empty until we have evidence the model is loaded.
             residents: Vec::new(),
+            configured_models,
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
         })
@@ -424,6 +430,7 @@ impl RuntimeAdapter for HttpInspectAdapter {
             runtime_id: self.id.clone(),
             available,
             residents: Vec::new(),
+            configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
         })
@@ -863,6 +870,59 @@ mod tests {
             snapshot.residents.len(),
             0,
             "configured models without runtime evidence must not be hot"
+        );
+    }
+
+    #[tokio::test]
+    async fn llama_swap_inspect_populates_residents_from_models_endpoint() {
+        // Name preserved from issue #46. Per the residency truth contract,
+        // /v1/models proves configuration, not residency — so configured
+        // models surface in `configured_models`, not `residents`.
+        let server = spawn_fixture(vec![
+            http_response(200, "{}"),
+            http_response(
+                200,
+                r#"{"data":[{"id":"models/qwen9b.gguf"},{"id":"granite8b"}]}"#,
+            ),
+        ])
+        .await;
+        let adapter = LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let snapshot = adapter.inspect().await.expect("snapshot");
+
+        assert!(snapshot.available);
+        assert_eq!(
+            snapshot.configured_models,
+            vec![
+                ModelId("qwen9b".to_string()),
+                ModelId("granite8b".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn llama_swap_inspect_marks_residents_as_configured_not_hot() {
+        // Name preserved from issue #46. Configured models from /v1/models must
+        // not be reported as residents at all — residency requires evidence
+        // beyond configuration (see residency-truth-contract.md).
+        let server = spawn_fixture(vec![
+            http_response(200, "{}"),
+            http_response(200, r#"{"data":[{"id":"models/qwen9b.gguf"}]}"#),
+        ])
+        .await;
+        let adapter = LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let snapshot = adapter.inspect().await.expect("snapshot");
+
+        assert_eq!(
+            snapshot.configured_models,
+            vec![ModelId("qwen9b".to_string())]
+        );
+        assert!(
+            snapshot.residents.is_empty(),
+            "configured models must not appear as residents"
         );
     }
 
