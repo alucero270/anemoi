@@ -2,7 +2,7 @@ use anemoi_core::{
     validate_config, AnemoiConfig, DiagnosticSeverity, DomainId, ExecutionMode, InferenceRequest,
     RequestId,
 };
-use anemoi_daemon::AppState;
+use anemoi_daemon::{AppState, OperatorStatus};
 use anemoi_telemetry::default_decision_log;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -88,13 +88,10 @@ async fn run(args: Args) -> anyhow::Result<String> {
 
     match args.command {
         Command::Status => {
-            output.push_str(&format!("Domains: {}\n", config.domains.len()));
-            output.push_str(&format!("Models: {}\n", config.models.len()));
-            output.push_str(&format!("Runtimes: {}\n", config.runtimes.len()));
-            output.push_str(&format!(
-                "Residency groups: {}\n",
-                config.residency_groups.len()
-            ));
+            // One reconciliation tick to populate the cache, then report purely
+            // from the reconciled snapshot — no further live inspection.
+            state.run_reconciliation_tick().await;
+            output.push_str(&format_status(&state.operator_status().await));
         }
         Command::Residents => {
             let snapshots = state.snapshots().await;
@@ -156,6 +153,108 @@ fn format_policy_check(config: &AnemoiConfig) -> String {
     output
 }
 
+fn format_status(status: &OperatorStatus) -> String {
+    let mut output = String::from("Anemoi operator status\n======================\n");
+
+    output.push_str(&format!(
+        "Live execution: {}\n",
+        if status.live_execution_enabled {
+            "enabled"
+        } else {
+            "disabled (ANEMOI_ENABLE_LIVE_EXECUTE not set)"
+        }
+    ));
+    output.push_str(&format!(
+        "Reconciliation cache: {}\n",
+        if status.cache_populated {
+            "populated"
+        } else {
+            "empty (governance state unknown until first inspection)"
+        }
+    ));
+    output.push_str(&format!(
+        "Active requests: {}\n",
+        status.active_request_count
+    ));
+    output.push_str(&format!(
+        "Recent decisions: {}\n",
+        status.recent_decision_count
+    ));
+
+    output.push_str("\nRuntimes:\n");
+    for runtime in &status.runtimes {
+        output.push_str(&format!(
+            "  {} ({}): availability={}, freshness={}\n",
+            runtime.runtime_id, runtime.adapter, runtime.availability, runtime.freshness
+        ));
+        if let Some(error) = &runtime.last_error {
+            output.push_str(&format!("    last error: {error}\n"));
+        }
+        output.push_str(&format!(
+            "    active requests: {}\n",
+            runtime.active_request_count
+        ));
+        if runtime.residents.is_empty() {
+            output.push_str("    residents: none observed\n");
+        } else {
+            output.push_str("    residents:\n");
+            for resident in &runtime.residents {
+                let idle = resident
+                    .idle_secs
+                    .map(|s| format!("{s}s"))
+                    .unwrap_or_else(|| "unknown".to_string());
+                output.push_str(&format!(
+                    "      - {} [{}] idle: {}\n",
+                    resident.model_id,
+                    format_residency_state(&resident.state),
+                    idle
+                ));
+            }
+        }
+    }
+
+    output.push_str("\nResidency groups:\n");
+    for group in &status.residency_groups {
+        let flags = match (group.keep_hot, group.pinned) {
+            (true, true) => "keep-hot, pinned",
+            (true, false) => "keep-hot",
+            (false, true) => "pinned",
+            (false, false) => "no protection",
+        };
+        output.push_str(&format!(
+            "  {}: {} ({}, {}/{} hot)\n",
+            group.group_id, group.health, flags, group.hot_resident_count, group.member_count
+        ));
+    }
+
+    output.push_str(&format!(
+        "\nStaging queue: total {} (blocked {}, pending {}, failed {}, completed {})\n",
+        status.staging.total,
+        status.staging.blocked,
+        status.staging.pending,
+        status.staging.failed,
+        status.staging.completed
+    ));
+
+    output.push_str("\nPolicy warnings:\n");
+    if status.policy_warnings.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for warning in &status.policy_warnings {
+            output.push_str(&format!("  - {warning}\n"));
+        }
+    }
+
+    output
+}
+
+fn format_residency_state(state: &anemoi_core::ResidencyState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{state:?}"))
+}
+
 fn format_decision(decision: &anemoi_core::Decision) -> String {
     let mut output = String::new();
     output.push_str(&format!(
@@ -188,13 +287,47 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn cli_status_prints_configured_counts() {
+    async fn cli_status_prints_residents_staging_and_policy_summary() {
         let output = run_cli(["anemoi", "--config", &example_config_path(), "status"]).await;
 
-        assert!(output.contains("Domains: 1"));
-        assert!(output.contains("Models: 3"));
-        assert!(output.contains("Runtimes: 1"));
-        assert!(output.contains("Residency groups: 2"));
+        // Residents observed from the reconciled cache.
+        assert!(output.contains("mock"), "runtime should be listed");
+        assert!(output.contains("qwen9b"), "resident model should be listed");
+        assert!(
+            output.contains("hot_gpu"),
+            "resident state should be listed"
+        );
+
+        // Residency group health.
+        assert!(output.contains("small_swarm"));
+        assert!(output.contains("large_models"));
+
+        // Staging queue summary.
+        assert!(output.to_lowercase().contains("staging queue"));
+
+        // Policy / governance summary.
+        assert!(output.to_lowercase().contains("policy warnings"));
+        assert!(output.to_lowercase().contains("live execution"));
+    }
+
+    #[tokio::test]
+    async fn cli_status_marks_unknown_and_stale_state_plainly() {
+        let config = AnemoiConfig::from_yaml_file(example_config_path()).expect("config");
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+
+        state.run_reconciliation_tick().await;
+        state.reconciler().mark_stale().await;
+
+        let output = format_status(&state.operator_status().await);
+        let lower = output.to_lowercase();
+
+        // Aged snapshot is plainly labeled stale, not silently treated as fresh.
+        assert!(lower.contains("stale"), "stale state must be labeled");
+        // Mock residents have no known load time, so idle is plainly unknown.
+        assert!(
+            lower.contains("unknown"),
+            "unknown state must be labeled, not omitted"
+        );
     }
 
     #[tokio::test]
