@@ -130,6 +130,10 @@ pub struct ModelProfile {
     pub ram_required_mb: Option<u64>,
     pub cold_load_estimate_ms: Option<u64>,
     pub supported_runtimes: Vec<RuntimeId>,
+    /// Whether the model supports SSE streaming responses.
+    /// `None` means unknown (treat as permissive); `Some(false)` means
+    /// explicitly non-streaming; `Some(true)` means streaming is supported.
+    pub supports_streaming: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -481,6 +485,11 @@ pub struct ModelProfileConfig {
     pub ram_required_mb: Option<u64>,
     pub cold_load_estimate_ms: Option<u64>,
     pub supported_runtimes: Vec<RuntimeId>,
+    /// Whether the model supports SSE streaming responses.
+    /// `None` means unknown (treat as permissive); `Some(false)` means
+    /// explicitly non-streaming; `Some(true)` means streaming is supported.
+    #[serde(default)]
+    pub supports_streaming: Option<bool>,
 }
 
 impl ModelProfileConfig {
@@ -494,6 +503,7 @@ impl ModelProfileConfig {
             ram_required_mb: self.ram_required_mb,
             cold_load_estimate_ms: self.cold_load_estimate_ms,
             supported_runtimes: self.supported_runtimes,
+            supports_streaming: self.supports_streaming,
         }
     }
 }
@@ -963,6 +973,68 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn model_profile_config_deserializes_supports_streaming_true() {
+        let config: ModelProfileConfig = serde_yaml::from_str(
+            r#"
+family: qwen
+parameter_class: 9b
+supported_runtimes: [llama_swap]
+supports_streaming: true
+"#,
+        )
+        .expect("profile with supports_streaming: true");
+
+        assert_eq!(config.supports_streaming, Some(true));
+    }
+
+    #[test]
+    fn model_profile_config_deserializes_supports_streaming_false() {
+        let config: ModelProfileConfig = serde_yaml::from_str(
+            r#"
+family: qwen
+parameter_class: 9b
+supported_runtimes: [llama_swap]
+supports_streaming: false
+"#,
+        )
+        .expect("profile with supports_streaming: false");
+
+        assert_eq!(config.supports_streaming, Some(false));
+    }
+
+    #[test]
+    fn model_profile_config_supports_streaming_absent_is_none() {
+        let config: ModelProfileConfig = serde_yaml::from_str(
+            r#"
+family: qwen
+parameter_class: 9b
+supported_runtimes: [llama_swap]
+"#,
+        )
+        .expect("profile without supports_streaming");
+
+        assert_eq!(config.supports_streaming, None);
+    }
+
+    #[test]
+    fn into_profile_carries_supports_streaming() {
+        let config = ModelProfileConfig {
+            family: "qwen".to_string(),
+            parameter_class: "9b".to_string(),
+            context_window: None,
+            vram_required_mb: None,
+            ram_required_mb: None,
+            cold_load_estimate_ms: None,
+            supported_runtimes: vec![RuntimeId("llama_swap".to_string())],
+            supports_streaming: Some(true),
+        };
+
+        let profile = config.into_profile(ModelId("qwen9b".to_string()));
+
+        assert_eq!(profile.supports_streaming, Some(true));
     }
 
     #[test]

@@ -367,6 +367,17 @@ fn score_candidate(
         );
     }
 
+    if let Some(supports_streaming) = model.supports_streaming {
+        let detail = if supports_streaming {
+            format!("{} supports streaming responses", model.id)
+        } else {
+            format!("{} does not support streaming responses", model.id)
+        };
+        // Informational only: streaming capability is surfaced for the
+        // forwarding gateway but does not influence the score.
+        push(&mut score, &mut reasons, "streaming_capability", 0, detail);
+    }
+
     ScoredCandidate {
         action: candidate.action.clone(),
         candidate: candidate.clone(),
