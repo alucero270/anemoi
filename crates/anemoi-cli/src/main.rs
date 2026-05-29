@@ -283,6 +283,7 @@ fn format_decision(decision: &anemoi_core::Decision) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anemoi_core::ModelId;
     use anemoi_telemetry::InMemoryDecisionLog;
     use std::sync::Arc;
 
@@ -430,7 +431,7 @@ mod tests {
 
         let decision = state.decide(&request).await.expect("decision");
 
-        assert!(decision.selected_model.is_some());
+        assert_eq!(decision.selected_model, Some(ModelId("qwen9b".to_string())));
     }
 
     async fn run_cli<const N: usize>(args: [&str; N]) -> String {
