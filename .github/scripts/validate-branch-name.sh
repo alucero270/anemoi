@@ -18,8 +18,8 @@ case "$branch_name" in
     ;;
 esac
 
-if ! printf '%s' "$branch_name" | grep -Eq '^issue/[0-9]+-[a-z0-9][a-z0-9-]*$'; then
+if ! printf '%s' "$branch_name" | grep -Eq '^(issue|chore)/[0-9a-z][a-z0-9-]*$'; then
   echo "Invalid branch name: $branch_name" >&2
-  echo "Expected format: issue/<number>-short-description" >&2
+  echo "Expected format: issue/<number>-short-description or chore/<description>" >&2
   exit 1
 fi
