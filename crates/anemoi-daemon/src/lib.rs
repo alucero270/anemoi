@@ -953,7 +953,7 @@ mod tests {
         DecisionAction, DomainId, ExecutionMode, ModelId, ModelProfileConfig, ModelResident,
         RequestId, ResidencyState, RuntimeConfig, RuntimeId,
     };
-    use anemoi_telemetry::{DecisionLog, InMemoryDecisionLog};
+    use anemoi_telemetry::{decision_log_from, DecisionLog, InMemoryDecisionLog, SqliteEventStore};
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request};
     use serde_json::Value;
@@ -971,70 +971,46 @@ mod tests {
         assert!(state.is_ok());
     }
 
-    #[test]
-    fn daemon_starts_with_memory_store_when_database_url_is_missing() {
-        // When ANEMOI_DATABASE_URL is not set (or empty), should use in-memory store.
-        let config = example_config();
+    #[tokio::test]
+    async fn daemon_starts_with_memory_store_when_database_url_is_missing() {
+        // With no database URL, the daemon wires an in-memory log: a decision it
+        // records is retrievable from that same log instance.
+        let log = decision_log_from(None, None).expect("memory log");
+        let state = AppState::new(example_config(), log.clone()).expect("state");
 
-        // Create the decision log without database URL
-        let log: DynDecisionLog = Arc::new(InMemoryDecisionLog::default());
-        let state = AppState::new(config, log);
-
-        assert!(
-            state.is_ok(),
-            "daemon should start with memory store when no database URL is set"
-        );
+        let decision = state.decide(&sample_request()).await.expect("decide");
+        let found = log
+            .get_decision(decision.id)
+            .await
+            .expect("get")
+            .expect("decision is recorded in the memory log");
+        assert_eq!(found, decision);
     }
 
-    #[test]
-    fn daemon_uses_sqlite_store_when_database_url_is_present() {
-        // When ANEMOI_DATABASE_URL is set, use SQLite.
-        let config = example_config();
-
-        // Create a temporary database for this test.
+    #[tokio::test]
+    async fn daemon_uses_sqlite_store_when_database_url_is_present() {
+        // A `sqlite://` URL routes the daemon through the same code path the
+        // real binary uses (default_decision_log -> decision_log_from), and a
+        // decision it records survives a process "restart" (reopen of the file).
         let temp_db_path = std::env::temp_dir().join(format!("anemoi-test-{}.db", Uuid::new_v4()));
+        let url = format!("sqlite:///{}", temp_db_path.display());
 
-        // Set the environment variable to use SQLite
-        std::env::set_var(
-            "ANEMOI_DATABASE_URL",
-            format!("sqlite:///{}", temp_db_path.display()),
-        );
+        let decision = {
+            let log = decision_log_from(Some(&url), None).expect("sqlite log");
+            let state = AppState::new(example_config(), log).expect("state");
+            state.decide(&sample_request()).await.expect("decide")
+        };
 
-        let log = create_decision_log();
-        let state = AppState::new(config, log);
+        // Reopen the SQLite file fresh: the decision is durable across restart.
+        let reopened = SqliteEventStore::create(&temp_db_path).expect("reopen sqlite store");
+        let found = reopened
+            .get_decision(decision.id)
+            .await
+            .expect("get")
+            .expect("decision is durable in the SQLite store");
+        assert_eq!(found, decision);
 
-        // Clean up
-        std::env::remove_var("ANEMOI_DATABASE_URL");
         let _ = std::fs::remove_file(&temp_db_path);
-
-        assert!(
-            state.is_ok(),
-            "daemon should use SQLite store when ANEMOI_DATABASE_URL is set"
-        );
-    }
-
-    /// Creates a decision log based on ANEMOI_DATABASE_URL environment variable.
-    /// When the env var is set (e.g. `sqlite:///path/to/db.db`), uses SQLite store.
-    /// Otherwise defaults to in-memory storage.
-    pub fn create_decision_log() -> DynDecisionLog {
-        if let Ok(db_url) = std::env::var("ANEMOI_DATABASE_URL") {
-            // Parse sqlite:// path format
-            if db_url.starts_with("sqlite:///") || db_url.starts_with("sqlite://") {
-                let path = &db_url["sqlite:///".len()..];
-                match anemoi_telemetry::SqliteEventStore::create(path) {
-                    Ok(store) => return Arc::new(store),
-                    Err(e) => eprintln!("Failed to create SQLite store: {}", e),
-                }
-            } else if let Some(path) = db_url.strip_prefix("sqlite:") {
-                // Handle other formats
-                match anemoi_telemetry::SqliteEventStore::create(path) {
-                    Ok(store) => return Arc::new(store),
-                    Err(e) => eprintln!("Failed to create SQLite store: {}", e),
-                }
-            }
-        }
-        // Fall back to in-memory
-        Arc::new(InMemoryDecisionLog::default())
     }
 
     #[tokio::test]

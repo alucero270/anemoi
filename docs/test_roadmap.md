@@ -255,3 +255,11 @@ Prompt 27 passed with:
 - `sqlite_event_store_replays_decision_explanation_by_id`
 - `daemon_starts_with_memory_store_when_database_url_is_missing`
 - `daemon_uses_sqlite_store_when_database_url_is_present`
+- `sqlite_event_store_records_resident_event` (issue #12 `resident_events`)
+
+SQLite is the source of truth: `get_decision`/`list_decisions` read from the
+database, so every required test reopens the file (a process "restart") and
+asserts the recorded value round-trips, rather than asserting `is_ok`. The
+`resident_events` table follows the issue #12 schema with a NOT NULL
+`evidence_source`. `execution_events`/`policy_events` tables are deferred: no
+required test exercises them and they belong to later prompts (21-23).
