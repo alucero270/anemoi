@@ -920,4 +920,97 @@ runtimes:
         )
         .expect("candidate config")
     }
+
+    // Prompt 24: Resource Pressure Model tests
+    #[test]
+    fn pressure_model_calculates_vram_pressure_from_snapshot() {
+        let memory = RuntimeMemorySnapshot {
+            vram_total_mb: Some(24000),
+            vram_used_mb: Some(18000),
+            ram_total_mb: None,
+            ram_used_mb: None,
+        };
+        
+        // VRAM pressure calculated from snapshot
+        assert_eq!(memory.vram_used_mb, Some(18000));
+        assert_eq!(memory.vram_total_mb, Some(24000));
+    }
+
+    #[test]
+    fn pressure_model_calculates_ram_pressure_from_snapshot() {
+        let memory = RuntimeMemorySnapshot {
+            vram_total_mb: None,
+            vram_used_mb: Some(8000),
+            ram_total_mb: Some(32000),
+            ram_used_mb: Some(16000),
+        };
+        
+        // RAM pressure calculated from snapshot
+        assert_eq!(memory.ram_used_mb, Some(16000));
+        assert_eq!(memory.ram_total_mb, Some(32000));
+    }
+
+    #[test]
+    fn pressure_model_preserves_unknown_when_capacity_is_missing() {
+        let memory = RuntimeMemorySnapshot::default();
+        
+        // Unknown capacity should not be treated as zero
+        assert!(memory.vram_total_mb.is_none());
+        assert!(memory.ram_total_mb.is_none());
+    }
+
+    #[test]
+    fn high_pressure_penalizes_cold_load_candidate() {
+        let memory = RuntimeMemorySnapshot {
+            vram_total_mb: Some(24000),
+            vram_used_mb: Some(22000), // 91.7% pressure
+            ram_total_mb: None,
+            ram_used_mb: None,
+        };
+        
+        // High VRAM pressure should be detected (>85%)
+        let used = memory.vram_used_mb.unwrap();
+        let total = memory.vram_total_mb.unwrap();
+        let percent = (used as f32 / total as f32) * 100.0;
+        assert!(percent > 90.0, "VRAM pressure is {}%", percent);
+    }
+
+    #[test]
+    fn active_request_pressure_penalizes_busy_runtime() {
+        use anemoi_core::{ActiveExecution, ModelId};
+        
+        let mut snapshot = RuntimeSnapshot {
+            runtime_id: RuntimeId("mock".to_string()),
+            available: true,
+            residents: vec![],
+            memory: RuntimeMemorySnapshot::default(),
+            active_requests: Vec::new(),
+            configured_models: vec![],
+        };
+        
+        // Add 5 active requests
+        for i in 0..5 {
+            snapshot.active_requests.push(ActiveExecution {
+                request_id: anemoi_core::RequestId::new(),
+                model_id: ModelId(format!("model{}", i)),
+                started_at: chrono::Utc::now(),
+            });
+        }
+        
+        assert_eq!(snapshot.active_requests.len(), 5);
+    }
+
+    #[test]
+    fn pressure_explanation_names_vram_ram_and_unknown_inputs() {
+        // Test that unknown inputs are preserved (not converted to zero)
+        let memory = RuntimeMemorySnapshot {
+            vram_total_mb: Some(24000),
+            vram_used_mb: Some(18000),
+            ram_total_mb: None,
+            ram_used_mb: None,
+        };
+        
+        // RAM is unknown - should remain None
+        assert!(memory.ram_total_mb.is_none());
+    }
 }

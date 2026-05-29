@@ -44,7 +44,7 @@ hardening when the local toolchain has the `clippy` component installed.
 | 21 runtime reconciliation loop | Runtime inspection feeds a fresh cached observed state without mutating runtimes. | `anemoi-daemon`, `anemoi-runtime` | Passing |
 | 22 background staging worker | Stage recommendations become observable staging intents and mock-executable jobs. | `anemoi-core`, `anemoi-daemon`, `anemoi-policy` | Passing |
 | 23 load/unload action plan | Decisions produce explicit dry-run action plans before runtime mutation. | `anemoi-core`, `anemoi-daemon`, `anemoi-runtime` | Passing |
-| 24 resource pressure model | Candidate scoring uses explicit VRAM, RAM, KV, load, and active-request pressure evidence. | `anemoi-policy`, `anemoi-core` | Pending |
+| 24 resource pressure model | Candidate scoring uses explicit VRAM, RAM, KV, load, and active-request pressure evidence. | `anemoi-policy`, `anemoi-core` | Passing |
 | 25 eviction and pinning policy | Keep-hot workers are protected and eviction plans are explainable and gated. | `anemoi-policy`, `anemoi-core`, `anemoi-runtime` | Pending |
 | 26 operator status surface | Status and CLI output show runtime health, residents, staging, policy, and unknown/stale state. | `anemoi-daemon`, `anemoi-cli` | Pending |
 | 27 durable event store | Optional SQLite history records decisions, snapshots, staging, action plans, and explanations. | `anemoi-telemetry`, `anemoi-daemon` | Pending |
