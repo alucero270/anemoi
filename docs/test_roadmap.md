@@ -47,7 +47,7 @@ hardening when the local toolchain has the `clippy` component installed.
 | 24 resource pressure model | Candidate scoring uses explicit VRAM, RAM, KV, load, and active-request pressure evidence. | `anemoi-policy`, `anemoi-core` | Passing |
 | 25 eviction and pinning policy | Keep-hot workers are protected and eviction plans are explainable and gated. | `anemoi-policy`, `anemoi-core`, `anemoi-runtime` | Passing |
 | 26 operator status surface | Status and CLI output show runtime health, residents, staging, policy, and unknown/stale state. | `anemoi-daemon`, `anemoi-cli` | Passing |
-| 27 durable event store | Optional SQLite history records decisions, snapshots, staging, action plans, and explanations. | `anemoi-telemetry`, `anemoi-daemon` | Pending |
+| 27 durable event store | Optional SQLite history records decisions, snapshots, staging, action plans, and explanations. | `anemoi-telemetry`, `anemoi-daemon` | Passing |
 | 28 inference forwarding gateway | `POST /v1/chat/completions` maps model field to domain, runs decide, forwards to selected runtime, streams response. | `anemoi-daemon`, `anemoi-runtime`, `anemoi-core` | Pending |
 
 ## Current Focus
@@ -245,3 +245,13 @@ Prompt 20 passed with:
 - `ANEMOI_ENABLE_LIVE_EXECUTE=1` opt-in guard for non-mock execution
 - `docs/live_validation/controlled-execution-gate.md` with approval checklist
   and execution path table
+
+Prompt 27 passed with:
+
+- `sqlite_event_store_records_decision_event`
+- `sqlite_event_store_records_runtime_snapshot_event`
+- `sqlite_event_store_records_staging_event`
+- `sqlite_event_store_records_action_plan_event`
+- `sqlite_event_store_replays_decision_explanation_by_id`
+- `daemon_starts_with_memory_store_when_database_url_is_missing`
+- `daemon_uses_sqlite_store_when_database_url_is_present`
