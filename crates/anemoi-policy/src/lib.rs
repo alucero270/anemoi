@@ -8,6 +8,9 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+mod pressure;
+pub use pressure::{Pressure, PressureAssessment, PressureInputs, PressureModel, PressureReason};
+
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
     #[error("unknown domain {0}")]
@@ -199,6 +202,7 @@ pub struct Candidate {
     pub residency_state: ResidencyState,
     pub load_estimate_ms: u64,
     pub runtime_memory: RuntimeMemorySnapshot,
+    pub active_request_count: usize,
     pub group_keep_hot: bool,
 }
 
@@ -286,6 +290,7 @@ fn generate_candidate(
         residency_state: state,
         load_estimate_ms,
         runtime_memory: snapshot.memory.clone(),
+        active_request_count: snapshot.active_requests.len(),
         group_keep_hot: group.keep_hot,
     }
 }
@@ -341,18 +346,22 @@ fn score_candidate(
         );
     }
 
-    let pressure_penalty = candidate
-        .runtime_memory
-        .pressure_percent()
-        .map(|pressure| if pressure > 85 { -25 } else { 0 })
-        .unwrap_or(0);
-    push(
-        &mut score,
-        &mut reasons,
-        "memory_pressure",
-        pressure_penalty,
-        "runtime memory pressure was considered".to_string(),
-    );
+    let pressure = PressureModel::default().assess(&PressureInputs {
+        memory: &candidate.runtime_memory,
+        vram_required_mb: model.vram_required_mb,
+        ram_required_mb: model.ram_required_mb,
+        is_cold_load: candidate.action == DecisionAction::ColdLoad,
+        active_request_count: candidate.active_request_count,
+    });
+    for reason in pressure.reasons {
+        push(
+            &mut score,
+            &mut reasons,
+            &reason.code,
+            reason.impact,
+            reason.detail,
+        );
+    }
 
     if candidate.group_keep_hot || config.continuity.keep_small_worker_hot {
         push(
@@ -852,6 +861,176 @@ continuity:
                 |contribution| contribution.label == "continuity background staging"
                     && contribution.value == 50
             ));
+    }
+
+    #[test]
+    fn pressure_model_calculates_vram_pressure_from_snapshot() {
+        let memory = RuntimeMemorySnapshot {
+            vram_total_mb: Some(10_000),
+            vram_used_mb: Some(7_500),
+            ram_total_mb: None,
+            ram_used_mb: None,
+        };
+        let assessment = PressureModel::default().assess(&PressureInputs {
+            memory: &memory,
+            vram_required_mb: Some(1_000),
+            ram_required_mb: None,
+            is_cold_load: false,
+            active_request_count: 0,
+        });
+
+        assert_eq!(assessment.vram, Pressure::Known(0.75));
+    }
+
+    #[test]
+    fn pressure_model_calculates_ram_pressure_from_snapshot() {
+        let memory = RuntimeMemorySnapshot {
+            vram_total_mb: None,
+            vram_used_mb: None,
+            ram_total_mb: Some(8_000),
+            ram_used_mb: Some(6_000),
+        };
+        let assessment = PressureModel::default().assess(&PressureInputs {
+            memory: &memory,
+            vram_required_mb: None,
+            ram_required_mb: Some(2_000),
+            is_cold_load: false,
+            active_request_count: 0,
+        });
+
+        assert_eq!(assessment.ram, Pressure::Known(0.75));
+    }
+
+    #[test]
+    fn pressure_model_preserves_unknown_when_capacity_is_missing() {
+        let memory = RuntimeMemorySnapshot {
+            vram_total_mb: None,
+            vram_used_mb: Some(5_000),
+            ram_total_mb: None,
+            ram_used_mb: Some(4_000),
+        };
+        let assessment = PressureModel::default().assess(&PressureInputs {
+            memory: &memory,
+            vram_required_mb: Some(2_000),
+            ram_required_mb: Some(2_000),
+            is_cold_load: true,
+            active_request_count: 0,
+        });
+
+        // Missing capacity must stay unknown, never collapse into 0.0 pressure.
+        assert_eq!(assessment.vram, Pressure::Unknown);
+        assert_eq!(assessment.ram, Pressure::Unknown);
+        assert_ne!(assessment.vram, Pressure::Known(0.0));
+        assert_ne!(assessment.ram, Pressure::Known(0.0));
+    }
+
+    #[test]
+    fn high_pressure_penalizes_cold_load_candidate() {
+        let memory = RuntimeMemorySnapshot {
+            vram_total_mb: Some(10_000),
+            vram_used_mb: Some(9_000),
+            ram_total_mb: Some(16_000),
+            ram_used_mb: Some(8_000),
+        };
+        let model = PressureModel::default();
+
+        let cold = model.assess(&PressureInputs {
+            memory: &memory,
+            vram_required_mb: Some(2_000),
+            ram_required_mb: Some(2_000),
+            is_cold_load: true,
+            active_request_count: 0,
+        });
+        let reuse = model.assess(&PressureInputs {
+            memory: &memory,
+            vram_required_mb: Some(2_000),
+            ram_required_mb: Some(2_000),
+            is_cold_load: false,
+            active_request_count: 0,
+        });
+
+        assert!(
+            cold.penalty < 0,
+            "cold load under high pressure must be penalized, got {}",
+            cold.penalty
+        );
+        assert!(
+            cold.penalty < reuse.penalty,
+            "cold load ({}) must be penalized more than reuse ({})",
+            cold.penalty,
+            reuse.penalty
+        );
+    }
+
+    #[test]
+    fn pressure_explanation_names_vram_ram_and_unknown_inputs() {
+        let memory = RuntimeMemorySnapshot {
+            vram_total_mb: Some(10_000),
+            vram_used_mb: Some(5_000),
+            ram_total_mb: None,
+            ram_used_mb: None,
+        };
+        let assessment = PressureModel::default().assess(&PressureInputs {
+            memory: &memory,
+            vram_required_mb: Some(1_000),
+            ram_required_mb: Some(2_000),
+            is_cold_load: true,
+            active_request_count: 0,
+        });
+
+        assert!(
+            assessment
+                .reasons
+                .iter()
+                .any(|reason| reason.code.contains("vram")),
+            "expected a vram pressure reason"
+        );
+        assert!(
+            assessment
+                .reasons
+                .iter()
+                .any(|reason| reason.code.contains("ram") && !reason.code.contains("vram")),
+            "expected a ram pressure reason distinct from vram"
+        );
+        assert!(
+            assessment
+                .reasons
+                .iter()
+                .any(|reason| reason.detail.to_lowercase().contains("unknown")),
+            "expected an explicit unknown-capacity reason"
+        );
+    }
+
+    #[test]
+    fn active_request_pressure_penalizes_busy_runtime() {
+        let memory = RuntimeMemorySnapshot::default();
+        let model = PressureModel::default();
+
+        let busy = model.assess(&PressureInputs {
+            memory: &memory,
+            vram_required_mb: None,
+            ram_required_mb: None,
+            is_cold_load: false,
+            active_request_count: 4,
+        });
+        let idle = model.assess(&PressureInputs {
+            memory: &memory,
+            vram_required_mb: None,
+            ram_required_mb: None,
+            is_cold_load: false,
+            active_request_count: 0,
+        });
+
+        assert!(
+            busy.penalty < idle.penalty,
+            "busy runtime ({}) must score lower than idle ({})",
+            busy.penalty,
+            idle.penalty
+        );
+        assert!(busy
+            .reasons
+            .iter()
+            .any(|reason| { reason.code.contains("active_request") && reason.impact < 0 }));
     }
 
     fn candidate_request() -> InferenceRequest {
