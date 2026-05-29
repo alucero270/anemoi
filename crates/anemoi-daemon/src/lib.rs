@@ -110,7 +110,7 @@ impl Reconciler {
             let elapsed = Utc::now()
                 .signed_duration_since(r.last_inspected)
                 .num_milliseconds();
-            r.is_stale = elapsed > self.ttl_ms as i64;
+            r.is_stale = r.is_stale || elapsed > self.ttl_ms as i64;
         }
         reconciled
     }
@@ -124,7 +124,7 @@ impl Reconciler {
                 let elapsed = Utc::now()
                     .signed_duration_since(r.last_inspected)
                     .num_milliseconds();
-                r.is_stale = elapsed > self.ttl_ms as i64;
+                r.is_stale = r.is_stale || elapsed > self.ttl_ms as i64;
                 r
             })
             .collect()
@@ -300,6 +300,91 @@ impl Default for StagingWorker {
     }
 }
 
+/// Consolidated operator-facing view of all governance state, derived purely
+/// from the reconciled snapshot cache, configuration, staging queue, and
+/// decision log. Missing or aged data is labeled explicitly rather than
+/// silently omitted — see [`RuntimeStatus::freshness`] and unknown labels.
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorStatus {
+    /// Whether the reconciliation cache has any inspected runtimes yet.
+    pub cache_populated: bool,
+    /// One entry per configured runtime, including those never inspected.
+    pub runtimes: Vec<RuntimeStatus>,
+    /// Health of each configured residency group.
+    pub residency_groups: Vec<GroupHealth>,
+    /// Active inference requests observed across all runtimes.
+    pub active_request_count: usize,
+    /// Background staging queue summary.
+    pub staging: StagingSummary,
+    /// Number of decisions retained in the decision log.
+    pub recent_decision_count: usize,
+    /// Human-readable policy warnings (e.g. keep-hot group with no hot resident).
+    pub policy_warnings: Vec<String>,
+    /// Whether `ANEMOI_ENABLE_LIVE_EXECUTE=1` is set (live runtime mutation).
+    pub live_execution_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeStatus {
+    pub runtime_id: String,
+    pub adapter: String,
+    /// `"available"`, `"unavailable"`, or `"unknown"` (never inspected).
+    pub availability: String,
+    /// `"fresh"`, `"stale"`, or `"unknown"` (never inspected).
+    pub freshness: String,
+    pub last_inspected: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub active_request_count: usize,
+    pub residents: Vec<ResidentStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResidentStatus {
+    pub model_id: String,
+    pub state: ResidencyState,
+    /// Idle seconds since load; `None` means idle time is unknown.
+    pub idle_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupHealth {
+    pub group_id: String,
+    pub keep_hot: bool,
+    pub pinned: bool,
+    pub member_count: usize,
+    pub hot_resident_count: usize,
+    /// `"healthy"`, `"degraded"` (keep-hot group with no hot residents), or
+    /// `"unknown"` (no reconciled data yet).
+    pub health: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StagingSummary {
+    pub total: usize,
+    pub blocked: usize,
+    pub pending: usize,
+    pub failed: usize,
+    pub completed: usize,
+}
+
+impl StagingSummary {
+    fn from_intents(intents: &[StagingIntent]) -> Self {
+        let mut summary = StagingSummary {
+            total: intents.len(),
+            ..StagingSummary::default()
+        };
+        for intent in intents {
+            match intent.state {
+                StagingState::Blocked => summary.blocked += 1,
+                StagingState::Pending => summary.pending += 1,
+                StagingState::Failed => summary.failed += 1,
+                StagingState::Completed => summary.completed += 1,
+            }
+        }
+        summary
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config: AnemoiConfig,
@@ -439,6 +524,141 @@ impl AppState {
             }
         }
         snapshots
+    }
+
+    /// Build the consolidated operator status view from the reconciled cache,
+    /// configuration, staging queue, and decision log. Read-only: never
+    /// triggers live runtime inspection.
+    pub async fn operator_status(&self) -> OperatorStatus {
+        let reconciled = self.reconciler.all().await;
+        let cache_populated = !reconciled.is_empty();
+
+        let mut by_runtime: HashMap<String, ReconciledSnapshot> = HashMap::new();
+        for r in reconciled {
+            by_runtime.insert(r.snapshot.runtime_id.to_string(), r);
+        }
+
+        let now = Utc::now();
+        let mut runtimes = Vec::new();
+        let mut active_request_count = 0usize;
+
+        let mut runtime_ids: Vec<String> =
+            self.config.runtimes.keys().map(|k| k.to_string()).collect();
+        runtime_ids.sort();
+
+        for runtime_id in runtime_ids {
+            let adapter = self
+                .runtime_adapter_type(&runtime_id)
+                .unwrap_or("unknown")
+                .to_string();
+
+            match by_runtime.get(&runtime_id) {
+                Some(r) => {
+                    let availability = if r.snapshot.available {
+                        "available"
+                    } else {
+                        "unavailable"
+                    }
+                    .to_string();
+                    let freshness = if r.is_stale { "stale" } else { "fresh" }.to_string();
+                    let residents = r
+                        .snapshot
+                        .residents
+                        .iter()
+                        .map(|res| ResidentStatus {
+                            model_id: res.model_id.to_string(),
+                            state: res.state.clone(),
+                            idle_secs: res
+                                .loaded_since
+                                .map(|since| (now - since).num_seconds().max(0) as u64),
+                        })
+                        .collect();
+                    let active = r.snapshot.active_requests.len();
+                    active_request_count += active;
+                    runtimes.push(RuntimeStatus {
+                        runtime_id,
+                        adapter,
+                        availability,
+                        freshness,
+                        last_inspected: Some(r.last_inspected),
+                        last_error: r.last_error.clone(),
+                        active_request_count: active,
+                        residents,
+                    });
+                }
+                None => {
+                    runtimes.push(RuntimeStatus {
+                        runtime_id,
+                        adapter,
+                        availability: "unknown".to_string(),
+                        freshness: "unknown".to_string(),
+                        last_inspected: None,
+                        last_error: None,
+                        active_request_count: 0,
+                        residents: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        let hot_models: std::collections::HashSet<String> = by_runtime
+            .values()
+            .flat_map(|r| r.snapshot.residents.iter())
+            .filter(|res| matches!(res.state, ResidencyState::HotGpu | ResidencyState::Serving))
+            .map(|res| res.model_id.to_string())
+            .collect();
+
+        let mut residency_groups = Vec::new();
+        let mut policy_warnings = Vec::new();
+        let mut group_ids: Vec<_> = self.config.residency_groups.keys().cloned().collect();
+        group_ids.sort_by_key(|g| g.to_string());
+        for group_id in group_ids {
+            let group = &self.config.residency_groups[&group_id];
+            let hot_resident_count = group
+                .models
+                .iter()
+                .filter(|m| hot_models.contains(&m.to_string()))
+                .count();
+            let degraded = group.keep_hot && hot_resident_count == 0;
+            let health = if !cache_populated {
+                "unknown"
+            } else if degraded {
+                "degraded"
+            } else {
+                "healthy"
+            }
+            .to_string();
+            if cache_populated && degraded {
+                policy_warnings.push(format!("keep-hot group '{group_id}' has no hot residents"));
+            }
+            residency_groups.push(GroupHealth {
+                group_id: group_id.to_string(),
+                keep_hot: group.keep_hot,
+                pinned: group.pinned,
+                member_count: group.models.len(),
+                hot_resident_count,
+                health,
+            });
+        }
+
+        let staging = StagingSummary::from_intents(&self.staging_worker.get_all().await);
+        let recent_decision_count = self
+            .decision_log
+            .list_decisions()
+            .await
+            .map(|d| d.len())
+            .unwrap_or(0);
+
+        OperatorStatus {
+            cache_populated,
+            runtimes,
+            residency_groups,
+            active_request_count,
+            staging,
+            recent_decision_count,
+            policy_warnings,
+            live_execution_enabled: live_execution_enabled(),
+        }
     }
 
     pub async fn decide(&self, request: &InferenceRequest) -> anyhow::Result<Decision> {
@@ -766,7 +986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_returns_configured_counts() {
+    async fn status_returns_operator_summary() {
         let response = test_router()
             .oneshot(
                 Request::builder()
@@ -779,10 +999,11 @@ mod tests {
 
         let body = json_body(response).await;
 
-        assert_eq!(body["domains"], 1);
-        assert_eq!(body["models"], 3);
-        assert_eq!(body["runtimes"], 1);
-        assert_eq!(body["residency_groups"], 2);
+        assert!(body["runtimes"].is_array());
+        assert!(body["residency_groups"].is_array());
+        assert!(body["staging"].is_object());
+        assert!(body["recent_decision_count"].is_number());
+        assert!(body["live_execution_enabled"].is_boolean());
     }
 
     #[tokio::test]
@@ -1278,6 +1499,89 @@ mod tests {
             !snapshots.is_empty(),
             "reconciled snapshots should be available"
         );
+    }
+
+    #[tokio::test]
+    async fn status_summary_includes_runtime_availability_and_staleness() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        // Before any inspection, availability and freshness are explicitly
+        // unknown — never silently omitted.
+        let cold = state.operator_status().await;
+        assert!(!cold.cache_populated);
+        let mock_cold = cold
+            .runtimes
+            .iter()
+            .find(|r| r.runtime_id == "mock")
+            .expect("mock runtime listed even when uninspected");
+        assert_eq!(mock_cold.availability, "unknown");
+        assert_eq!(mock_cold.freshness, "unknown");
+        assert!(mock_cold.last_inspected.is_none());
+
+        state.run_reconciliation_tick().await;
+        let fresh = state.operator_status().await;
+        let mock_fresh = fresh
+            .runtimes
+            .iter()
+            .find(|r| r.runtime_id == "mock")
+            .expect("mock runtime");
+        assert_eq!(mock_fresh.availability, "available");
+        assert_eq!(mock_fresh.freshness, "fresh");
+        assert!(mock_fresh.last_inspected.is_some());
+
+        state.reconciler().mark_stale().await;
+        let aged = state.operator_status().await;
+        let mock_aged = aged
+            .runtimes
+            .iter()
+            .find(|r| r.runtime_id == "mock")
+            .expect("mock runtime");
+        assert_eq!(mock_aged.freshness, "stale");
+    }
+
+    #[tokio::test]
+    async fn status_summary_includes_residency_group_health() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+        state.run_reconciliation_tick().await;
+
+        let status = state.operator_status().await;
+        assert_eq!(status.residency_groups.len(), 2);
+
+        let small = status
+            .residency_groups
+            .iter()
+            .find(|g| g.group_id == "small_swarm")
+            .expect("small_swarm group");
+        assert!(small.keep_hot);
+        // qwen9b is hot_gpu in the mock runtime and belongs to small_swarm.
+        assert!(small.hot_resident_count >= 1);
+        assert_eq!(small.health, "healthy");
+
+        let large = status
+            .residency_groups
+            .iter()
+            .find(|g| g.group_id == "large_models")
+            .expect("large_models group");
+        assert!(!large.keep_hot);
+        assert_eq!(large.hot_resident_count, 0);
+        // Not keep-hot, so zero hot residents is still healthy.
+        assert_eq!(large.health, "healthy");
+    }
+
+    #[tokio::test]
+    async fn status_summary_includes_recent_decision_count() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+
+        let before = state.operator_status().await;
+        assert_eq!(before.recent_decision_count, 0);
+
+        state.decide(&sample_request()).await.expect("decision");
+
+        let after = state.operator_status().await;
+        assert_eq!(after.recent_decision_count, 1);
     }
 
     #[tokio::test]
@@ -1975,7 +2279,7 @@ pub fn openapi_document() -> serde_json::Value {
                             "description": "Configured control-plane counts",
                             "content": {
                                 "application/json": {
-                                    "schema": { "$ref": "#/components/schemas/StatusResponse" }
+                                    "schema": { "$ref": "#/components/schemas/OperatorStatus" }
                                 }
                             }
                         }
@@ -2104,14 +2408,27 @@ pub fn openapi_document() -> serde_json::Value {
                     "required": ["ok"],
                     "properties": { "ok": { "type": "boolean" } }
                 },
-                "StatusResponse": {
+                "OperatorStatus": {
                     "type": "object",
-                    "required": ["domains", "models", "runtimes", "residency_groups"],
+                    "required": [
+                        "cache_populated",
+                        "runtimes",
+                        "residency_groups",
+                        "active_request_count",
+                        "staging",
+                        "recent_decision_count",
+                        "policy_warnings",
+                        "live_execution_enabled"
+                    ],
                     "properties": {
-                        "domains": { "type": "integer" },
-                        "models": { "type": "integer" },
-                        "runtimes": { "type": "integer" },
-                        "residency_groups": { "type": "integer" }
+                        "cache_populated": { "type": "boolean" },
+                        "runtimes": { "type": "array", "items": { "type": "object" } },
+                        "residency_groups": { "type": "array", "items": { "type": "object" } },
+                        "active_request_count": { "type": "integer" },
+                        "staging": { "type": "object" },
+                        "recent_decision_count": { "type": "integer" },
+                        "policy_warnings": { "type": "array", "items": { "type": "string" } },
+                        "live_execution_enabled": { "type": "boolean" }
                     }
                 },
                 "InferenceRequest": {
@@ -2188,21 +2505,8 @@ pub fn openapi_document() -> serde_json::Value {
     })
 }
 
-#[derive(Serialize)]
-struct StatusResponse {
-    domains: usize,
-    models: usize,
-    runtimes: usize,
-    residency_groups: usize,
-}
-
-async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
-    Json(StatusResponse {
-        domains: state.config.domains.len(),
-        models: state.config.models.len(),
-        runtimes: state.config.runtimes.len(),
-        residency_groups: state.config.residency_groups.len(),
-    })
+async fn status(State(state): State<AppState>) -> Json<OperatorStatus> {
+    Json(state.operator_status().await)
 }
 
 async fn residents(State(state): State<AppState>) -> Json<Vec<RuntimeSnapshot>> {
