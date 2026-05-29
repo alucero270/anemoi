@@ -960,6 +960,8 @@ mod tests {
     use std::collections::HashMap;
     use tower::ServiceExt;
 
+    // anemoi-guard:allow vacuous-test - construction smoke test; richer
+    // no-database behavior is covered by cli_decide_works_without_database_url
     #[test]
     fn daemon_starts_without_database_url() {
         let config = example_config();
@@ -1746,10 +1748,13 @@ mod tests {
             .expect("execute should succeed");
 
         let intents = staging_worker.get_all().await;
-        let completed = intents.iter().find(|i| i.state == StagingState::Completed);
-        assert!(
-            completed.is_some(),
-            "staging should complete on mock runtime"
+        let completed = intents
+            .iter()
+            .find(|i| i.state == StagingState::Completed)
+            .expect("staging should complete on mock runtime");
+        assert_eq!(
+            completed.background_model,
+            ModelId("qwen35_a3b".to_string())
         );
     }
 
@@ -1858,10 +1863,11 @@ mod tests {
 
         let plan = state.generate_action_plan(&decision, true);
 
-        assert!(
-            plan.get_foreground_load().is_some(),
-            "action plan should contain foreground load for cold load decision"
-        );
+        let load = plan
+            .get_foreground_load()
+            .expect("action plan should contain foreground load for cold load decision");
+        assert_eq!(load.model_id, Some(ModelId("qwen35_a3b".to_string())));
+        assert_eq!(load.runtime_id, RuntimeId("mock".to_string()));
     }
 
     #[tokio::test]
@@ -1888,10 +1894,11 @@ mod tests {
 
         let plan = state.generate_action_plan(&decision, true);
 
-        assert!(
-            plan.get_background_load().is_some(),
-            "action plan should contain background load for stage background decision"
-        );
+        let load = plan
+            .get_background_load()
+            .expect("action plan should contain background load for stage background decision");
+        assert_eq!(load.model_id, Some(ModelId("qwen35_a3b".to_string())));
+        assert!(!load.is_foreground);
     }
 
     #[tokio::test]
