@@ -1,14 +1,18 @@
 use anemoi_core::{
-    ActionKind, ActionPlan, AnemoiConfig, Decision, DecisionAction, InferenceRequest, ModelId,
-    ModelResident, ResidencyState, RuntimeId, RuntimeSnapshot,
+    ActionKind, ActionPlan, AnemoiConfig, Decision, DecisionAction, DomainId, ExecutionMode,
+    InferenceRequest, ModelId, ModelResident, RequestId, ResidencyState, RuntimeId,
+    RuntimeSnapshot,
 };
 use anemoi_policy::{EvictionCandidateResident, EvictionPlan, EvictionRequest, Scheduler};
 use anemoi_runtime::{
-    DynRuntimeAdapter, LlamaCppAdapter, LlamaSwapAdapter, MockRuntimeAdapter, OllamaAdapter,
+    DynRuntimeAdapter, ForwardedChatCompletion, LlamaCppAdapter, LlamaSwapAdapter,
+    MockRuntimeAdapter, OllamaAdapter,
 };
 use anemoi_telemetry::{DynDecisionLog, InMemoryDecisionLog};
+use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -393,6 +397,10 @@ pub struct AppState {
     decision_log: DynDecisionLog,
     reconciler: Reconciler,
     staging_worker: StagingWorker,
+    /// Test seam for the live-execute gate. `None` reads the real
+    /// `ANEMOI_ENABLE_LIVE_EXECUTE` env var (production); `Some(_)` overrides it
+    /// so tests can exercise the gate without mutating process-global state.
+    live_execute: Option<bool>,
 }
 
 impl AppState {
@@ -464,6 +472,34 @@ impl AppState {
             decision_log,
             reconciler,
             staging_worker,
+            live_execute: None,
+        })
+    }
+
+    /// Whether forwarding to a non-mock runtime is permitted. Production reads
+    /// `ANEMOI_ENABLE_LIVE_EXECUTE=1`; tests can override via
+    /// [`AppState::with_live_execute`].
+    pub fn live_execute_enabled(&self) -> bool {
+        self.live_execute.unwrap_or_else(live_execution_enabled)
+    }
+
+    #[cfg(test)]
+    fn with_live_execute(mut self, enabled: bool) -> Self {
+        self.live_execute = Some(enabled);
+        self
+    }
+
+    /// Resolves the forward target (base URL + auth token) for a runtime from
+    /// config. Returns `None` when the runtime is unknown or has no base URL.
+    fn runtime_forward_target(&self, runtime_id: &str) -> Option<anemoi_runtime::ForwardTarget> {
+        let config = self
+            .config
+            .runtimes
+            .get(&RuntimeId(runtime_id.to_string()))?;
+        let base_url = config.base_url.clone()?;
+        Some(anemoi_runtime::ForwardTarget {
+            base_url,
+            auth_token: config.auth_token.clone(),
         })
     }
 
@@ -505,6 +541,7 @@ impl AppState {
             decision_log: Arc::new(InMemoryDecisionLog::default()),
             reconciler,
             staging_worker,
+            live_execute: None,
         })
     }
 
@@ -2241,6 +2278,280 @@ runtimes:
             "decide burst must reuse the reconciler cache; got {total} inspects"
         );
     }
+
+    fn chat_body(model: &str) -> Value {
+        serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "hello" }],
+        })
+    }
+
+    async fn body_value(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    fn decision_id_header(response: &Response) -> Uuid {
+        let raw = response
+            .headers()
+            .get("x-anemoi-decision-id")
+            .expect("x-anemoi-decision-id header")
+            .to_str()
+            .expect("header is ascii");
+        Uuid::parse_str(raw).expect("decision id is a uuid")
+    }
+
+    /// Config whose only runtime is a non-mock (ollama) adapter pointed at a dead
+    /// port. The reconciler is pre-seeded by the caller so `decide` selects this
+    /// runtime without any live `inspect()`.
+    fn non_mock_gateway_state(live_execute: bool) -> AppState {
+        let yaml = r#"
+domains:
+  coding:
+    rosters:
+      - ollama_group
+residency_groups:
+  ollama_group:
+    purpose:
+      - test
+    keep_hot: true
+    allow_background_load: false
+    models:
+      - llama8b
+models:
+  llama8b:
+    family: llama
+    parameter_class: 8b
+    context_window: 8192
+    vram_required_mb: 8000
+    ram_required_mb: 10000
+    cold_load_estimate_ms: 12000
+    supports_streaming: true
+    supported_runtimes:
+      - remote
+runtimes:
+  remote:
+    adapter: ollama
+    base_url: http://127.0.0.1:9
+    initial_residents:
+      - model_id: llama8b
+        state: hot_gpu
+        vram_mb: 8000
+        ram_mb: 10000
+continuity:
+  keep_small_worker_hot: true
+  background_load: false
+  max_blank_wait_ms: 1500
+  prefer_degraded_response_over_silence: true
+"#;
+        let config = AnemoiConfig::from_yaml_str(yaml).expect("non-mock config");
+        AppState::with_mock_residents(config, HashMap::new())
+            .expect("state")
+            .with_live_execute(live_execute)
+    }
+
+    fn remote_hot_snapshot() -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            runtime_id: RuntimeId("remote".to_string()),
+            available: true,
+            residents: vec![ModelResident {
+                model_id: ModelId("llama8b".to_string()),
+                state: ResidencyState::HotGpu,
+                vram_mb: Some(8000),
+                ram_mb: Some(10000),
+                kv_cache_mb: None,
+                loaded_since: Some(chrono::Utc::now()),
+            }],
+            configured_models: vec![ModelId("llama8b".to_string())],
+            memory: anemoi_core::RuntimeMemorySnapshot::default(),
+            active_requests: vec![],
+        }
+    }
+
+    #[test]
+    fn inference_gateway_maps_model_field_to_domain() {
+        assert_eq!(resolve_domain("coding"), "coding");
+        assert_eq!(resolve_domain("general"), "general");
+    }
+
+    #[test]
+    fn inference_gateway_strips_anemoi_prefix_from_model_field() {
+        assert_eq!(resolve_domain("anemoi-coding"), "coding");
+        // Only the leading `anemoi-` is stripped; bare names are unchanged.
+        assert_eq!(resolve_domain("coding"), "coding");
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_returns_error_for_unknown_domain() {
+        let response = test_router()
+            .oneshot(json_request("/v1/chat/completions", &chat_body("nonsense")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_value(response).await;
+        assert_eq!(body["error"]["type"], "anemoi_gateway_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("nonsense"),
+            "error should name the unknown domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_runs_decide_before_forwarding() {
+        let log = Arc::new(InMemoryDecisionLog::default());
+        let state = AppState::new(example_config(), log.clone()).expect("state");
+
+        let response = router(state)
+            .oneshot(json_request("/v1/chat/completions", &chat_body("coding")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let id = decision_id_header(&response);
+        assert!(
+            log.get_decision(id).await.expect("log").is_some(),
+            "a decision must be recorded before forwarding"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_rewrites_model_to_selected_model() {
+        let response = test_router()
+            .oneshot(json_request("/v1/chat/completions", &chat_body("coding")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let selected = response
+            .headers()
+            .get("x-anemoi-selected-model")
+            .expect("x-anemoi-selected-model header")
+            .to_str()
+            .expect("ascii")
+            .to_string();
+        assert_ne!(
+            selected, "coding",
+            "selected model must be a runtime model, not the domain"
+        );
+
+        // The mock runtime echoes the model it was asked to serve, proving the
+        // caller's domain hint was rewritten to the governed model id.
+        let body = body_text(response).await;
+        assert!(
+            body.contains(&selected),
+            "forwarded SSE body should reference the selected model `{selected}`"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_records_decision_in_telemetry() {
+        let log = Arc::new(InMemoryDecisionLog::default());
+        let state = AppState::new(example_config(), log.clone()).expect("state");
+
+        let response = router(state)
+            .oneshot(json_request("/v1/chat/completions", &chat_body("coding")))
+            .await
+            .expect("response");
+
+        let id = decision_id_header(&response);
+        let recorded = log
+            .get_decision(id)
+            .await
+            .expect("log")
+            .expect("decision recorded in telemetry");
+        assert_eq!(recorded.id, id);
+        assert!(recorded.selected_model.is_some());
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_returns_decision_id_in_response_header() {
+        let response = test_router()
+            .oneshot(json_request("/v1/chat/completions", &chat_body("coding")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        // Parses as a uuid or panics.
+        let _ = decision_id_header(&response);
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_forwards_mock_without_live_execute_flag() {
+        // test_router has no live-execute flag set; the mock runtime must still
+        // forward because mock forwarding never touches a real runtime.
+        let response = test_router()
+            .oneshot(json_request("/v1/chat/completions", &chat_body("coding")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        assert!(
+            body.contains("data:"),
+            "mock forward should return an SSE stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_requires_live_execute_flag_for_non_mock() {
+        let state = non_mock_gateway_state(false);
+        state
+            .reconciler()
+            .update("remote", remote_hot_snapshot())
+            .await;
+
+        let response = router(state)
+            .oneshot(json_request("/v1/chat/completions", &chat_body("coding")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = body_value(response).await;
+        assert_eq!(body["error"]["type"], "anemoi_gateway_error");
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_returns_structured_error_on_runtime_failure() {
+        let state = non_mock_gateway_state(true);
+        state
+            .reconciler()
+            .update("remote", remote_hot_snapshot())
+            .await;
+
+        let response = router(state)
+            .oneshot(json_request("/v1/chat/completions", &chat_body("coding")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let id_header = response
+            .headers()
+            .get("x-anemoi-decision-id")
+            .expect("decision id header on forwarding failure")
+            .to_str()
+            .expect("ascii")
+            .to_string();
+        let body = body_value(response).await;
+        assert_eq!(body["error"]["type"], "anemoi_gateway_error");
+        assert_eq!(
+            body["error"]["decision_id"].as_str().expect("decision_id"),
+            id_header,
+            "structured error must carry the decision id"
+        );
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -2253,6 +2564,8 @@ pub fn router(state: AppState) -> Router {
         .route("/decisions/:id", get(decision))
         .route("/explain/:id", get(explain))
         .route("/staging", get(staging))
+        .route("/v1/models", get(list_models))
+        .route("/v1/chat/completions", post(chat_completions))
         .route("/openapi.json", get(openapi))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -2686,4 +2999,209 @@ async fn explain(
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+// ===== Inference Forwarding Gateway (prompt 28) =====
+
+/// Latency budget applied to gateway-originated decisions when the caller does
+/// not express one. The OpenAI chat-completions schema has no budget field.
+const DEFAULT_GATEWAY_LATENCY_BUDGET_MS: u64 = 30_000;
+
+/// Treats the OpenAI `model` field as a governance domain hint, stripping the
+/// optional `anemoi-` prefix. `"coding"` and `"anemoi-coding"` both map to the
+/// `coding` domain.
+fn resolve_domain(model_field: &str) -> &str {
+    model_field.strip_prefix("anemoi-").unwrap_or(model_field)
+}
+
+fn decision_action_str(action: &DecisionAction) -> String {
+    serde_json::to_value(action)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+#[derive(Serialize)]
+struct ModelCatalog {
+    object: &'static str,
+    data: Vec<ModelCatalogEntry>,
+}
+
+#[derive(Serialize)]
+struct ModelCatalogEntry {
+    id: String,
+    object: &'static str,
+    owned_by: &'static str,
+    anemoi_domain: bool,
+}
+
+/// `GET /v1/models` — OpenAI-format catalog of governance **domains** (issue
+/// #15). Runtime model ids never appear here; the caller selects a domain and
+/// Anemoi governs which model serves it. No live inspection is triggered.
+async fn list_models(State(state): State<AppState>) -> Json<ModelCatalog> {
+    let mut data: Vec<ModelCatalogEntry> = state
+        .config
+        .domains
+        .keys()
+        .map(|domain| ModelCatalogEntry {
+            id: domain.to_string(),
+            object: "model",
+            owned_by: "anemoi",
+            anemoi_domain: true,
+        })
+        .collect();
+    data.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(ModelCatalog {
+        object: "list",
+        data,
+    })
+}
+
+/// Builds an OpenAI-style structured error. When a decision was already made,
+/// its id is included in the body and echoed as `X-Anemoi-Decision-Id` so the
+/// caller can query `/explain/:id`.
+fn gateway_error(
+    status: StatusCode,
+    message: impl Into<String>,
+    decision_id: Option<Uuid>,
+) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": message.into(),
+            "type": "anemoi_gateway_error",
+            "decision_id": decision_id.map(|id| id.to_string()),
+        }
+    });
+    let mut response = (status, Json(body)).into_response();
+    if let Some(id) = decision_id {
+        if let Ok(value) = HeaderValue::from_str(&id.to_string()) {
+            response.headers_mut().insert("x-anemoi-decision-id", value);
+        }
+    }
+    response
+}
+
+/// `POST /v1/chat/completions` — OpenAI-compatible inference forwarding. The
+/// caller names a domain in `model`; Anemoi decides which runtime model serves
+/// it, records the decision, rewrites `model` to the selected model, forwards
+/// to the runtime, and streams the response back. The caller never selects a
+/// runtime model directly.
+async fn chat_completions(
+    State(state): State<AppState>,
+    Json(mut body): Json<serde_json::Value>,
+) -> Response {
+    let Some(model_field) = body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    else {
+        return gateway_error(
+            StatusCode::BAD_REQUEST,
+            "request is missing a string `model` field",
+            None,
+        );
+    };
+    let domain = resolve_domain(&model_field).to_string();
+
+    // Unknown domain is rejected before any decision or forwarding.
+    if !state.config.domains.contains_key(&DomainId(domain.clone())) {
+        return gateway_error(
+            StatusCode::BAD_REQUEST,
+            format!("unknown domain `{domain}`"),
+            None,
+        );
+    }
+
+    // Run the same decision path as POST /decide; this records telemetry.
+    let request = InferenceRequest {
+        id: RequestId::new(),
+        domain: DomainId(domain.clone()),
+        mode: ExecutionMode::Interactive,
+        prompt_tokens_estimate: None,
+        max_output_tokens: None,
+        latency_budget_ms: Some(DEFAULT_GATEWAY_LATENCY_BUDGET_MS),
+        quality_floor: None,
+    };
+    let decision = match state.decide(&request).await {
+        Ok(decision) => decision,
+        Err(error) => {
+            return gateway_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string(), None)
+        }
+    };
+
+    let (Some(selected_model), Some(selected_runtime)) = (
+        decision.selected_model.clone(),
+        decision.selected_runtime.clone(),
+    ) else {
+        return gateway_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "no runnable model for domain `{domain}`: {}",
+                decision.explanation.summary
+            ),
+            Some(decision.id),
+        );
+    };
+
+    let runtime_id = selected_runtime.to_string();
+    let is_mock = state.runtime_adapter_type(&runtime_id) == Some("mock");
+    if !is_mock && !state.live_execute_enabled() {
+        return gateway_error(
+            StatusCode::FORBIDDEN,
+            "forwarding to a non-mock runtime requires ANEMOI_ENABLE_LIVE_EXECUTE=1",
+            Some(decision.id),
+        );
+    }
+
+    // The caller's domain hint is replaced with the governed model id.
+    body["model"] = serde_json::Value::String(selected_model.to_string());
+
+    let forwarded = if is_mock {
+        anemoi_runtime::mock_chat_completion(&selected_model.to_string())
+    } else {
+        let Some(target) = state.runtime_forward_target(&runtime_id) else {
+            return gateway_error(
+                StatusCode::BAD_GATEWAY,
+                format!("runtime `{runtime_id}` has no base_url configured"),
+                Some(decision.id),
+            );
+        };
+        match anemoi_runtime::forward_chat_completion(&target, &body).await {
+            Ok(forwarded) => forwarded,
+            Err(error) => {
+                return gateway_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("runtime forward failed: {error}"),
+                    Some(decision.id),
+                )
+            }
+        }
+    };
+
+    gateway_stream_response(forwarded, &decision, &selected_model)
+}
+
+fn gateway_stream_response(
+    forwarded: ForwardedChatCompletion,
+    decision: &Decision,
+    selected_model: &ModelId,
+) -> Response {
+    let status = StatusCode::from_u16(forwarded.status).unwrap_or(StatusCode::OK);
+    let content_type = forwarded
+        .content_type
+        .unwrap_or_else(|| "text/event-stream".to_string());
+    let builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header("x-anemoi-decision-id", decision.id.to_string())
+        .header("x-anemoi-selected-model", selected_model.to_string())
+        .header("x-anemoi-action", decision_action_str(&decision.action));
+    match builder.body(Body::from_stream(forwarded.body)) {
+        Ok(response) => response,
+        Err(error) => gateway_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.to_string(),
+            Some(decision.id),
+        ),
+    }
 }

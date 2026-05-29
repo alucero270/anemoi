@@ -4,6 +4,7 @@ use anemoi_core::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::stream::{BoxStream, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Url;
 use serde::Deserialize;
@@ -625,6 +626,87 @@ fn normalize_model_id(raw: &str) -> ModelId {
             .unwrap_or(leaf)
             .to_string(),
     )
+}
+
+/// Where a forwarded chat completion should go. `auth_token` originates from
+/// the environment (expanded at config load) and is never committed.
+#[derive(Debug, Clone)]
+pub struct ForwardTarget {
+    pub base_url: String,
+    pub auth_token: Option<String>,
+}
+
+/// A chat-completion response forwarded back from a runtime. The body is a
+/// stream so the caller can relay it without buffering (the inference gateway
+/// requirement).
+pub struct ForwardedChatCompletion {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: BoxStream<'static, Result<Vec<u8>, RuntimeError>>,
+}
+
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Forwards an OpenAI-style chat completion `body` to a runtime's
+/// `/v1/chat/completions` endpoint, injecting the runtime bearer token when one
+/// is configured. The response body is streamed straight through; only
+/// transport failures (connection refused, timeout) surface as an `Err`.
+pub async fn forward_chat_completion(
+    target: &ForwardTarget,
+    body: &serde_json::Value,
+) -> Result<ForwardedChatCompletion, RuntimeError> {
+    let base =
+        Url::parse(&target.base_url).map_err(|error| RuntimeError::Url(error.to_string()))?;
+    let url = base
+        .join("/v1/chat/completions")
+        .map_err(|error| RuntimeError::Url(error.to_string()))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(FORWARD_TIMEOUT)
+        .build()?;
+    let mut request = client.post(url).json(body);
+    if let Some(token) = &target.auth_token {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request.send().await?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response
+        .bytes_stream()
+        .map(|chunk| {
+            chunk
+                .map(|bytes| bytes.to_vec())
+                .map_err(RuntimeError::from)
+        })
+        .boxed();
+
+    Ok(ForwardedChatCompletion {
+        status,
+        content_type,
+        body,
+    })
+}
+
+/// Builds a deterministic OpenAI-style SSE response for the mock runtime. The
+/// payload echoes `selected_model`, so a test can confirm the gateway rewrote
+/// the `model` field to the decision's selected model. No network is involved.
+pub fn mock_chat_completion(selected_model: &str) -> ForwardedChatCompletion {
+    let chunk = format!(
+        "data: {{\"object\":\"chat.completion.chunk\",\"model\":\"{selected_model}\",\
+\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"mock response from {selected_model}\"}}}}]}}\n\n"
+    );
+    let chunks: Vec<Result<Vec<u8>, RuntimeError>> =
+        vec![Ok(chunk.into_bytes()), Ok(b"data: [DONE]\n\n".to_vec())];
+    ForwardedChatCompletion {
+        status: 200,
+        content_type: Some("text/event-stream".to_string()),
+        body: futures::stream::iter(chunks).boxed(),
+    }
 }
 
 #[cfg(test)]
@@ -1439,6 +1521,46 @@ mod tests {
             .expect_err("invalid url");
 
         assert!(error.to_string().contains("invalid runtime url"));
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_injects_runtime_auth_token() {
+        let server = spawn_fixture(vec![http_response(200, "{}")]).await;
+        let target = ForwardTarget {
+            base_url: server.base_url.clone(),
+            auth_token: Some("s3cr3t-token".to_string()),
+        };
+        let body = serde_json::json!({ "model": "qwen9b", "messages": [] });
+
+        forward_chat_completion(&target, &body)
+            .await
+            .expect("forward");
+
+        let request = server.requests.lock().expect("requests")[0].to_lowercase();
+        assert!(
+            request.contains("authorization: bearer s3cr3t-token"),
+            "forwarded request must carry the runtime bearer token, got:\n{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_chat_completion_omits_auth_when_unset() {
+        let server = spawn_fixture(vec![http_response(200, "{}")]).await;
+        let target = ForwardTarget {
+            base_url: server.base_url.clone(),
+            auth_token: None,
+        };
+        let body = serde_json::json!({ "model": "qwen9b", "messages": [] });
+
+        forward_chat_completion(&target, &body)
+            .await
+            .expect("forward");
+
+        let request = server.requests.lock().expect("requests")[0].to_lowercase();
+        assert!(
+            !request.contains("authorization:"),
+            "no auth header should be sent when the runtime has no token"
+        );
     }
 
     struct TestServer {

@@ -48,11 +48,11 @@ hardening when the local toolchain has the `clippy` component installed.
 | 25 eviction and pinning policy | Keep-hot workers are protected and eviction plans are explainable and gated. | `anemoi-policy`, `anemoi-core`, `anemoi-runtime` | Passing |
 | 26 operator status surface | Status and CLI output show runtime health, residents, staging, policy, and unknown/stale state. | `anemoi-daemon`, `anemoi-cli` | Passing |
 | 27 durable event store | Optional SQLite history records decisions, snapshots, staging, action plans, and explanations. | `anemoi-telemetry`, `anemoi-daemon` | Passing |
-| 28 inference forwarding gateway | `POST /v1/chat/completions` maps model field to domain, runs decide, forwards to selected runtime, streams response. | `anemoi-daemon`, `anemoi-runtime`, `anemoi-core` | Pending |
+| 28 inference forwarding gateway | `POST /v1/chat/completions` maps model field to domain, runs decide, forwards to selected runtime, streams response. | `anemoi-daemon`, `anemoi-runtime`, `anemoi-core` | Passing |
 
 ## Current Focus
 
-Build prompts 00-20 are passing. Prompts 21-27 are defined and pending. Prompt 28 is the active priority: inference forwarding gateway to make Anemoi an OpenAI-compatible endpoint for opencode.
+Build prompts 00-28 are passing. Prompt 28 (inference forwarding gateway) makes Anemoi an OpenAI-compatible endpoint for opencode: `POST /v1/chat/completions` treats the `model` field as a governance domain, runs `decide`, records telemetry, rewrites `model` to the selected runtime model, and streams the runtime response back with `X-Anemoi-Decision-Id`, `X-Anemoi-Selected-Model`, and `X-Anemoi-Action` headers. Mock forwarding works without `ANEMOI_ENABLE_LIVE_EXECUTE=1`; non-mock forwarding requires it.
 
 Prompt 01 passed with:
 
@@ -263,3 +263,27 @@ asserts the recorded value round-trips, rather than asserting `is_ok`. The
 `resident_events` table follows the issue #12 schema with a NOT NULL
 `evidence_source`. `execution_events`/`policy_events` tables are deferred: no
 required test exercises them and they belong to later prompts (21-23).
+
+Prompt 28 passed with:
+
+- `inference_gateway_maps_model_field_to_domain`
+- `inference_gateway_strips_anemoi_prefix_from_model_field`
+- `inference_gateway_returns_error_for_unknown_domain`
+- `inference_gateway_runs_decide_before_forwarding`
+- `inference_gateway_rewrites_model_to_selected_model`
+- `inference_gateway_injects_runtime_auth_token` (`anemoi-runtime`)
+- `inference_gateway_records_decision_in_telemetry`
+- `inference_gateway_returns_decision_id_in_response_header`
+- `inference_gateway_requires_live_execute_flag_for_non_mock`
+- `inference_gateway_forwards_mock_without_live_execute_flag`
+- `inference_gateway_returns_structured_error_on_runtime_failure`
+
+The caller names a governance **domain** in the OpenAI `model` field (never a
+runtime model); the gateway resolves it (stripping an optional `anemoi-`
+prefix), runs the same decision path as `/decide` so telemetry is recorded,
+rewrites `model` to the selected runtime model, and streams the runtime
+response back. Forwarding lives in `anemoi-runtime` (`forward_chat_completion`
++ `mock_chat_completion`) so the daemon stays reqwest-free. Non-mock forwarding
+is gated behind `ANEMOI_ENABLE_LIVE_EXECUTE=1` (prompt 20); mock forwarding is
+always allowed for offline development. Runtime failures return an
+OpenAI-shaped structured error carrying the decision id.
