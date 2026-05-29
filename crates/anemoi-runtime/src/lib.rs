@@ -258,7 +258,148 @@ impl RuntimeAdapter for OllamaAdapter {
     }
 }
 
-pub type LlamaCppAdapter = HttpInspectAdapter;
+/// Inspect-only adapter for a llama.cpp / `llama-server` instance.
+///
+/// llama.cpp exposes an OpenAI-compatible `/v1/models` endpoint and a
+/// `/health` endpoint. Per the residency truth contract
+/// (`docs/live_validation/residency-truth-contract.md`), `/v1/models` proves
+/// configuration, not residency — so `inspect()` surfaces those ids in
+/// `configured_models` and leaves `residents` empty. This adapter never
+/// loads, unloads, or executes.
+#[derive(Debug, Clone)]
+pub struct LlamaCppAdapter {
+    id: RuntimeId,
+    base_url: Url,
+    client: reqwest::Client,
+    auth_token: Option<String>,
+}
+
+impl LlamaCppAdapter {
+    pub fn new(id: RuntimeId, base_url: &str) -> Result<Self, RuntimeError> {
+        Self::new_with_timeout(id, base_url, Duration::from_secs(5))
+    }
+
+    pub fn new_with_timeout(
+        id: RuntimeId,
+        base_url: &str,
+        timeout: Duration,
+    ) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            id,
+            base_url: Url::parse(base_url).map_err(|error| RuntimeError::Url(error.to_string()))?,
+            client: reqwest::Client::builder().timeout(timeout).build()?,
+            auth_token: None,
+        })
+    }
+
+    /// Configure a bearer token. The token must originate from the environment
+    /// (expanded at config load); it is never committed.
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Returns the configured model ids reported by `/v1/models`. This is
+    /// configuration evidence, not residency evidence.
+    pub async fn inspect_models(&self) -> Result<Vec<ModelId>, RuntimeError> {
+        let url = self
+            .base_url
+            .join("/v1/models")
+            .map_err(|error| RuntimeError::Url(error.to_string()))?;
+        let response: LlamaCppModelsResponse = self
+            .client
+            .get(url)
+            .headers(self.headers()?)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(response
+            .data
+            .into_iter()
+            .map(|model| normalize_model_id(&model.id))
+            .collect())
+    }
+
+    fn headers(&self) -> Result<HeaderMap, RuntimeError> {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = &self.auth_token {
+            let value = HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|error| RuntimeError::Url(error.to_string()))?;
+            headers.insert(AUTHORIZATION, value);
+        }
+        Ok(headers)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LlamaCppModelsResponse {
+    #[serde(default)]
+    data: Vec<LlamaCppModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlamaCppModel {
+    id: String,
+}
+
+#[async_trait]
+impl RuntimeAdapter for LlamaCppAdapter {
+    fn id(&self) -> RuntimeId {
+        self.id.clone()
+    }
+
+    async fn inspect(&self) -> Result<RuntimeSnapshot, RuntimeError> {
+        let health_url = self
+            .base_url
+            .join("/health")
+            .map_err(|error| RuntimeError::Url(error.to_string()))?;
+        let health = self
+            .client
+            .get(health_url)
+            .headers(self.headers()?)
+            .send()
+            .await?;
+
+        if !health.status().is_success() {
+            return Ok(RuntimeSnapshot {
+                runtime_id: self.id.clone(),
+                available: false,
+                residents: Vec::new(),
+                configured_models: Vec::new(),
+                memory: RuntimeMemorySnapshot::default(),
+                active_requests: Vec::new(),
+            });
+        }
+
+        let configured_models = self.inspect_models().await?;
+
+        Ok(RuntimeSnapshot {
+            runtime_id: self.id.clone(),
+            available: true,
+            // /v1/models proves configuration, not residency — see
+            // docs/live_validation/residency-truth-contract.md. residents
+            // stays empty until we have evidence the model is loaded.
+            residents: Vec::new(),
+            configured_models,
+            memory: RuntimeMemorySnapshot::default(),
+            active_requests: Vec::new(),
+        })
+    }
+
+    async fn load_model(&self, _model: &ModelId) -> Result<LoadHandle, RuntimeError> {
+        Err(RuntimeError::Unsupported("llama-cpp load"))
+    }
+
+    async fn unload_model(&self, _model: &ModelId) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Unsupported("llama-cpp unload"))
+    }
+
+    async fn execute(&self, _request: ExecutionRequest) -> Result<ExecutionHandle, RuntimeError> {
+        Err(RuntimeError::Unsupported("llama-cpp execute"))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LlamaSwapAdapter {
@@ -1125,6 +1266,176 @@ mod tests {
     #[test]
     fn ollama_base_url_validation_rejects_invalid_url() {
         let error = OllamaAdapter::new(RuntimeId("ollama".to_string()), "not a url")
+            .expect_err("invalid url");
+
+        assert!(error.to_string().contains("invalid runtime url"));
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_health_marks_runtime_available() {
+        let server = spawn_fixture(vec![
+            http_response(200, "{}"),
+            http_response(200, r#"{"data":[]}"#),
+        ])
+        .await;
+        let adapter = LlamaCppAdapter::new(RuntimeId("llama_cpp".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let snapshot = adapter.inspect().await.expect("snapshot");
+
+        assert!(snapshot.available);
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_failed_health_marks_runtime_unavailable() {
+        let server = spawn_fixture(vec![http_response(500, "{}")]).await;
+        let adapter = LlamaCppAdapter::new(RuntimeId("llama_cpp".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let snapshot = adapter.inspect().await.expect("snapshot");
+
+        assert!(!snapshot.available);
+        assert!(snapshot.residents.is_empty());
+        assert!(snapshot.configured_models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_models_response_normalizes_model_ids() {
+        let server = spawn_fixture(vec![http_response(
+            200,
+            r#"{"data":[{"id":"models/qwen9b.gguf"},{"id":"granite8b"}]}"#,
+        )])
+        .await;
+        let adapter = LlamaCppAdapter::new(RuntimeId("llama_cpp".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let models = adapter.inspect_models().await.expect("models");
+
+        assert_eq!(
+            models,
+            vec![
+                ModelId("qwen9b".to_string()),
+                ModelId("granite8b".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_inspect_surfaces_configured_models_without_claiming_residency() {
+        let server = spawn_fixture(vec![
+            http_response(200, "{}"),
+            http_response(200, r#"{"data":[{"id":"models/qwen9b.gguf"}]}"#),
+        ])
+        .await;
+        let adapter = LlamaCppAdapter::new(RuntimeId("llama_cpp".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let snapshot = adapter.inspect().await.expect("snapshot");
+
+        assert_eq!(snapshot.runtime_id, RuntimeId("llama_cpp".to_string()));
+        assert!(snapshot.available);
+        assert_eq!(
+            snapshot.configured_models,
+            vec![ModelId("qwen9b".to_string())]
+        );
+        assert!(
+            snapshot.residents.is_empty(),
+            "/v1/models proves configuration, not residency"
+        );
+        assert_eq!(snapshot.memory, RuntimeMemorySnapshot::default());
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_probe_uses_get_only() {
+        let server = spawn_fixture(vec![
+            http_response(200, "{}"),
+            http_response(200, r#"{"data":[]}"#),
+        ])
+        .await;
+        let adapter = LlamaCppAdapter::new(RuntimeId("llama_cpp".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let _ = adapter.inspect().await.expect("inspect");
+
+        let requests = server.requests.lock().expect("requests").clone();
+        for request_text in &requests {
+            assert!(
+                request_text.starts_with("GET"),
+                "inspect must use GET only, got: {request_text:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_load_unload_execute_are_unsupported() {
+        let adapter =
+            LlamaCppAdapter::new(RuntimeId("llama_cpp".to_string()), "http://localhost:8080")
+                .expect("adapter");
+        let model = ModelId("qwen9b".to_string());
+
+        let load_error = adapter.load_model(&model).await.expect_err("load");
+        let unload_error = adapter.unload_model(&model).await.expect_err("unload");
+        let execute_error = adapter
+            .execute(ExecutionRequest {
+                request_id: RequestId::new(),
+                model_id: model,
+                prompt: None,
+            })
+            .await
+            .expect_err("execute");
+
+        assert_eq!(
+            load_error.to_string(),
+            "runtime operation is not supported: llama-cpp load"
+        );
+        assert_eq!(
+            unload_error.to_string(),
+            "runtime operation is not supported: llama-cpp unload"
+        );
+        assert_eq!(
+            execute_error.to_string(),
+            "runtime operation is not supported: llama-cpp execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_auth_header_is_applied_when_configured() {
+        let server = spawn_fixture(vec![
+            http_response(200, "{}"),
+            http_response(200, r#"{"data":[]}"#),
+        ])
+        .await;
+        let adapter = LlamaCppAdapter::new(RuntimeId("llama_cpp".to_string()), &server.base_url)
+            .expect("adapter")
+            .with_bearer_token("secret");
+
+        let _ = adapter.inspect().await.expect("snapshot");
+
+        let requests = server.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer secret")));
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_timeout_returns_runtime_error() {
+        let base_url = spawn_timeout_server().await;
+        let adapter = LlamaCppAdapter::new_with_timeout(
+            RuntimeId("llama_cpp".to_string()),
+            &base_url,
+            Duration::from_millis(50),
+        )
+        .expect("adapter");
+
+        let error = adapter.inspect().await.expect_err("timeout");
+
+        assert!(matches!(error, RuntimeError::Http(error) if error.is_timeout()));
+    }
+
+    #[test]
+    fn llama_cpp_base_url_validation_rejects_invalid_url() {
+        let error = LlamaCppAdapter::new(RuntimeId("llama_cpp".to_string()), "not a url")
             .expect_err("invalid url");
 
         assert!(error.to_string().contains("invalid runtime url"));

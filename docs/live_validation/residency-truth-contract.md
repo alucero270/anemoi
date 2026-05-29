@@ -64,6 +64,18 @@ This ensures Anemoi is conservative: unknown means cold until proven otherwise.
   rejected-options reasoning, but it must not contribute a hot-reuse
   bonus and it does not change the `Cold` residency state of any model.
 
-### HttpInspectAdapter (llama.cpp / llama_server)
+### LlamaCppAdapter (llama.cpp / llama_server)
+- `/health` confirms the process is reachable (maps to `available`).
+- `/v1/models` lists models served by the process but does **not** prove GPU
+  residency.
+- `inspect()` returns empty residents. Configured models remain `Cold`.
+- `inspect_models()` returns model IDs for reference, not residency.
+- The configured model list is surfaced on the snapshot as
+  `configured_models: Vec<ModelId>` — configuration evidence, not residency
+  evidence. It must not contribute a hot-reuse bonus.
+- The adapter inspects only: `load_model`, `unload_model`, and `execute` all
+  return `RuntimeError::Unsupported`.
+
+### HttpInspectAdapter (generic reachability probe)
 - Health check confirms process is reachable.
 - No model-level inspection is performed. All models are `Cold`.

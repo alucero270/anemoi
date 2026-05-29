@@ -4,7 +4,7 @@ use anemoi_core::{
 };
 use anemoi_policy::Scheduler;
 use anemoi_runtime::{
-    DynRuntimeAdapter, HttpInspectAdapter, LlamaSwapAdapter, MockRuntimeAdapter, OllamaAdapter,
+    DynRuntimeAdapter, LlamaCppAdapter, LlamaSwapAdapter, MockRuntimeAdapter, OllamaAdapter,
 };
 use anemoi_telemetry::{DynDecisionLog, InMemoryDecisionLog};
 use axum::extract::{Path, State};
@@ -349,13 +349,21 @@ impl AppState {
                     };
                     Arc::new(adapter)
                 }
-                "llama_cpp" | "llama_server" => Arc::new(HttpInspectAdapter::new(
-                    runtime_id.clone(),
-                    runtime
-                        .base_url
-                        .as_deref()
-                        .unwrap_or("http://localhost:8080"),
-                )?),
+                "llama_cpp" | "llama_server" => {
+                    let adapter = LlamaCppAdapter::new(
+                        runtime_id.clone(),
+                        runtime
+                            .base_url
+                            .as_deref()
+                            .unwrap_or("http://localhost:8080"),
+                    )?;
+                    let adapter = if let Some(token) = &runtime.auth_token {
+                        adapter.with_bearer_token(token)
+                    } else {
+                        adapter
+                    };
+                    Arc::new(adapter)
+                }
                 _ => Arc::new(MockRuntimeAdapter::new(runtime_id.clone(), Vec::new())),
             };
             runtimes.insert(runtime_id.to_string(), adapter);

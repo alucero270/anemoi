@@ -55,3 +55,8 @@ opening `http://127.0.0.1:7071/health` and `http://localhost:7071/health`.
 - Full inference forwarding is intentionally not implemented in v1.
 - Live Ollama, llama-swap, and llama.cpp environments are not required for the
   mock-config demo and need separate live validation when used.
+- `LlamaCppAdapter` (`llama_cpp` / `llama_server`) is implemented and
+  fixture-tested as an inspect-only adapter (`/health` + `/v1/models` →
+  `configured_models`, empty residents). Live validation against a real
+  `llama-server` is pending — see
+  `docs/live_validation/llama-cpp-probe.md`.
