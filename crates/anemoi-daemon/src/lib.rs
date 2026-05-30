@@ -536,6 +536,14 @@ impl AppState {
                     } else {
                         adapter
                     };
+                    // Read the matrix block from the llama-swap YAML, if a path
+                    // is configured, so the adapter can answer colocation
+                    // questions. Absent or unset leaves matrix awareness off.
+                    let adapter = if let Some(path) = &runtime.config_path {
+                        adapter.with_matrix_config_path(path)?
+                    } else {
+                        adapter
+                    };
                     // Subscribe to the push-based residency stream so inspect()
                     // observes real load state. No-op outside a tokio runtime.
                     if let Some(stream) = adapter.start_event_stream() {
@@ -1542,6 +1550,7 @@ mod tests {
                 base_url: Some("http://127.0.0.1:8085".to_string()),
                 auth_token: None,
                 initial_residents: Vec::new(),
+                config_path: None,
             },
         );
         // Add a model that references the new runtime.
@@ -2573,6 +2582,7 @@ runtimes:
                 base_url: Some("http://127.0.0.1:9".to_string()),
                 auth_token: None,
                 initial_residents: vec![],
+                config_path: None,
             },
         );
 
@@ -2657,6 +2667,7 @@ runtimes:
                 base_url: Some("http://127.0.0.1:11434".to_string()),
                 auth_token: None,
                 initial_residents: vec![],
+                config_path: None,
             },
         );
 

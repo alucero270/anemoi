@@ -8,7 +8,7 @@ use futures::stream::{BoxStream, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Url;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
@@ -23,6 +23,8 @@ pub enum RuntimeError {
     Url(String),
     #[error("runtime operation is not supported: {0}")]
     Unsupported(&'static str),
+    #[error("failed to load llama-swap config: {0}")]
+    Config(String),
 }
 
 #[derive(Debug, Clone)]
@@ -425,6 +427,11 @@ pub struct LlamaSwapAdapter {
     /// from the `/api/events` SSE stream. Shared (cloned `Arc`) with any event
     /// stream started off this adapter, so `inspect` observes live state.
     model_states: ModelStateCache,
+    /// Parsed `matrix` block from the llama-swap YAML, when a config path was
+    /// supplied via [`LlamaSwapAdapter::with_matrix_config_path`]. `None` means
+    /// matrix awareness is disabled and [`LlamaSwapAdapter::can_colocate`]
+    /// conservatively reports that no two models are known to colocate.
+    matrix: Option<LlamaSwapMatrixConfig>,
 }
 
 impl LlamaSwapAdapter {
@@ -443,12 +450,49 @@ impl LlamaSwapAdapter {
             client: reqwest::Client::builder().timeout(timeout).build()?,
             auth_token: None,
             model_states: Arc::new(RwLock::new(HashMap::new())),
+            matrix: None,
         })
     }
 
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(token.into());
         self
+    }
+
+    /// Reads and parses the `matrix` block from the llama-swap YAML config at
+    /// `path`, enabling colocation awareness via
+    /// [`LlamaSwapAdapter::can_colocate`]. A config file without a `matrix`
+    /// block parses successfully and leaves matrix awareness disabled. Returns
+    /// [`RuntimeError::Config`] when the file cannot be read or parsed.
+    pub fn with_matrix_config_path(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, RuntimeError> {
+        self.matrix = LlamaSwapMatrixConfig::from_yaml_file(path)?;
+        Ok(self)
+    }
+
+    /// Sets the parsed matrix config directly. Primarily for callers that have
+    /// already loaded the config; most code should prefer
+    /// [`LlamaSwapAdapter::with_matrix_config_path`].
+    pub fn with_matrix_config(mut self, matrix: LlamaSwapMatrixConfig) -> Self {
+        self.matrix = Some(matrix);
+        self
+    }
+
+    /// The parsed matrix config, or `None` when matrix awareness is disabled.
+    pub fn matrix(&self) -> Option<&LlamaSwapMatrixConfig> {
+        self.matrix.as_ref()
+    }
+
+    /// Whether `a` and `b` can be GPU-resident at the same time according to the
+    /// llama-swap matrix colocation sets. Returns `false` when matrix awareness
+    /// is disabled (no config supplied) — absent a declared colocation set, the
+    /// safe assumption is that loading one model evicts the other.
+    pub fn can_colocate(&self, a: &ModelId, b: &ModelId) -> bool {
+        self.matrix
+            .as_ref()
+            .is_some_and(|matrix| matrix.can_colocate(a, b))
     }
 
     /// Read handle to the push-updated model-state cache. Empty until an event
@@ -506,6 +550,202 @@ impl LlamaSwapAdapter {
         }
         Ok(headers)
     }
+}
+
+/// The `matrix` block of a llama-swap YAML config. llama-swap does not expose
+/// this over its API, so Anemoi reads the file directly (both run on the same
+/// host). Anemoi reads the colocation sets to answer feasibility questions; it
+/// does not re-implement llama-swap's matrix solver, so `vars` and
+/// `evict_costs` are retained verbatim for callers that want the raw numbers.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct LlamaSwapMatrixConfig {
+    /// Free-form numeric variables (e.g. `gpu: 24576` for total VRAM in MB).
+    #[serde(default)]
+    pub vars: HashMap<String, u64>,
+    /// Per-model cold-load cost estimates in milliseconds, keyed by model id.
+    #[serde(default)]
+    pub evict_costs: HashMap<String, u64>,
+    /// Declared colocation sets. Each set's `models` expression names the
+    /// models that may be GPU-resident together.
+    #[serde(default)]
+    pub sets: Vec<ColocationSet>,
+}
+
+/// One named colocation set. `models` is a llama-swap matrix DSL expression
+/// over model ids using `&` (colocate / AND), `|` (alternative / OR), and
+/// parentheses for grouping — e.g. `qwen9b & qwen35_a3b` or
+/// `(qwen9b | qwen4b) & gemma`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ColocationSet {
+    pub name: String,
+    pub models: String,
+}
+
+/// Wrapper that picks only the `matrix` block out of a full llama-swap config
+/// file. Every other top-level key (models, groups, healthCheckTimeout, ...) is
+/// ignored, so the same parser tolerates an arbitrary llama-swap config.
+#[derive(Debug, Deserialize)]
+struct LlamaSwapConfigFile {
+    #[serde(default)]
+    matrix: Option<LlamaSwapMatrixConfig>,
+}
+
+impl LlamaSwapMatrixConfig {
+    /// Parses the `matrix` block out of the llama-swap YAML at `path`. Returns
+    /// `Ok(None)` when the file parses but declares no `matrix` block.
+    pub fn from_yaml_file(path: impl AsRef<std::path::Path>) -> Result<Option<Self>, RuntimeError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| RuntimeError::Config(error.to_string()))?;
+        Self::from_yaml_str(&text)
+    }
+
+    /// Parses the `matrix` block out of a llama-swap YAML string. Returns
+    /// `Ok(None)` when the document parses but declares no `matrix` block.
+    pub fn from_yaml_str(text: &str) -> Result<Option<Self>, RuntimeError> {
+        let file: LlamaSwapConfigFile =
+            serde_yaml::from_str(text).map_err(|error| RuntimeError::Config(error.to_string()))?;
+        Ok(file.matrix)
+    }
+
+    /// Whether `a` and `b` may be GPU-resident at the same time: `true` when
+    /// some colocation set admits a loadout containing both. Models joined only
+    /// by `|` are alternatives and do not colocate on that basis.
+    pub fn can_colocate(&self, a: &ModelId, b: &ModelId) -> bool {
+        self.sets
+            .iter()
+            .flat_map(|set| set.loadouts())
+            .any(|loadout| loadout.contains(&a.0) && loadout.contains(&b.0))
+    }
+}
+
+impl ColocationSet {
+    /// Co-resident loadouts implied by this set's `models` DSL expression: each
+    /// returned group is a set of model ids that may be resident together. An
+    /// all-`&` expression yields one group; `|` branches yield one group per
+    /// alternative. A malformed expression yields no groups.
+    fn loadouts(&self) -> Vec<BTreeSet<String>> {
+        parse_colocation_expr(&self.models)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MatrixToken {
+    Ident(String),
+    And,
+    Or,
+    Open,
+    Close,
+}
+
+fn tokenize_colocation_expr(expr: &str) -> Vec<MatrixToken> {
+    let mut tokens = Vec::new();
+    let mut ident = String::new();
+    for ch in expr.chars() {
+        let operator = match ch {
+            '&' => Some(MatrixToken::And),
+            '|' => Some(MatrixToken::Or),
+            '(' => Some(MatrixToken::Open),
+            ')' => Some(MatrixToken::Close),
+            _ => None,
+        };
+        match operator {
+            Some(token) => {
+                if !ident.is_empty() {
+                    tokens.push(MatrixToken::Ident(std::mem::take(&mut ident)));
+                }
+                tokens.push(token);
+            }
+            None if ch.is_whitespace() => {
+                if !ident.is_empty() {
+                    tokens.push(MatrixToken::Ident(std::mem::take(&mut ident)));
+                }
+            }
+            None => ident.push(ch),
+        }
+    }
+    if !ident.is_empty() {
+        tokens.push(MatrixToken::Ident(ident));
+    }
+    tokens
+}
+
+/// Parses a matrix colocation DSL expression into its co-resident loadouts.
+/// Grammar: `expr := term ('|' term)*`, `term := factor ('&' factor)*`,
+/// `factor := IDENT | '(' expr ')'`. `&` unions loadouts (co-resident); `|`
+/// concatenates them (alternatives). Parsing is lenient: unbalanced or empty
+/// input yields no loadouts rather than erroring.
+fn parse_colocation_expr(expr: &str) -> Vec<BTreeSet<String>> {
+    let tokens = tokenize_colocation_expr(expr);
+    let mut pos = 0;
+    let loadouts = parse_or(&tokens, &mut pos);
+    dedup_loadouts(loadouts)
+}
+
+fn parse_or(tokens: &[MatrixToken], pos: &mut usize) -> Vec<BTreeSet<String>> {
+    let mut loadouts = parse_and(tokens, pos);
+    while matches!(tokens.get(*pos), Some(MatrixToken::Or)) {
+        *pos += 1;
+        loadouts.extend(parse_and(tokens, pos));
+    }
+    loadouts
+}
+
+fn parse_and(tokens: &[MatrixToken], pos: &mut usize) -> Vec<BTreeSet<String>> {
+    let mut loadouts = parse_factor(tokens, pos);
+    while matches!(tokens.get(*pos), Some(MatrixToken::And)) {
+        *pos += 1;
+        let rhs = parse_factor(tokens, pos);
+        loadouts = cross_union(&loadouts, &rhs);
+    }
+    loadouts
+}
+
+fn parse_factor(tokens: &[MatrixToken], pos: &mut usize) -> Vec<BTreeSet<String>> {
+    match tokens.get(*pos) {
+        Some(MatrixToken::Ident(id)) => {
+            *pos += 1;
+            vec![BTreeSet::from([id.clone()])]
+        }
+        Some(MatrixToken::Open) => {
+            *pos += 1;
+            let inner = parse_or(tokens, pos);
+            if matches!(tokens.get(*pos), Some(MatrixToken::Close)) {
+                *pos += 1;
+            }
+            inner
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Cross product of two loadout lists, unioning each pair (the `&` operator).
+/// An empty side means that operand had no parseable models; the other side is
+/// returned unchanged so a trailing or malformed operand cannot erase models.
+fn cross_union(lhs: &[BTreeSet<String>], rhs: &[BTreeSet<String>]) -> Vec<BTreeSet<String>> {
+    if lhs.is_empty() {
+        return rhs.to_vec();
+    }
+    if rhs.is_empty() {
+        return lhs.to_vec();
+    }
+    let mut out = Vec::new();
+    for left in lhs {
+        for right in rhs {
+            out.push(left.union(right).cloned().collect());
+        }
+    }
+    out
+}
+
+fn dedup_loadouts(loadouts: Vec<BTreeSet<String>>) -> Vec<BTreeSet<String>> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for loadout in loadouts {
+        if seen.insert(loadout.clone()) {
+            out.push(loadout);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Deserialize)]
@@ -2054,5 +2294,206 @@ mod tests {
             "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    fn m(id: &str) -> ModelId {
+        ModelId::from(id)
+    }
+
+    #[test]
+    fn matrix_parses_vars_evict_costs_and_sets() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  vars:
+    gpu: 24576
+  evict_costs:
+    minimax: 90000
+    qwen9b: 1
+  sets:
+    - name: small_plus_medium
+      models: qwen9b & qwen35_a3b
+"#,
+        )
+        .expect("parse")
+        .expect("matrix block present");
+
+        assert_eq!(matrix.vars.get("gpu"), Some(&24_576));
+        assert_eq!(matrix.evict_costs.get("minimax"), Some(&90_000));
+        assert_eq!(matrix.evict_costs.get("qwen9b"), Some(&1));
+        assert_eq!(matrix.sets.len(), 1);
+        assert_eq!(matrix.sets[0].name, "small_plus_medium");
+        assert_eq!(matrix.sets[0].models, "qwen9b & qwen35_a3b");
+    }
+
+    #[test]
+    fn can_colocate_true_for_models_in_shared_and_set() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: pair
+      models: qwen9b & qwen35_a3b
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        assert!(matrix.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+        assert!(matrix.can_colocate(&m("qwen35_a3b"), &m("qwen9b")));
+    }
+
+    #[test]
+    fn can_colocate_false_for_models_not_in_any_set_together() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: pair
+      models: qwen9b & qwen35_a3b
+    - name: solo
+      models: minimax
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        // minimax runs alone — it shares no set with the colocating pair.
+        assert!(!matrix.can_colocate(&m("qwen9b"), &m("minimax")));
+        assert!(!matrix.can_colocate(&m("qwen35_a3b"), &m("minimax")));
+        // A model absent from every set never colocates.
+        assert!(!matrix.can_colocate(&m("qwen9b"), &m("gemma")));
+    }
+
+    #[test]
+    fn or_branches_are_alternatives_not_colocated() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: either
+      models: qwen9b | qwen35_a3b
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        assert!(!matrix.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+    }
+
+    #[test]
+    fn grouping_colocates_each_alternative_with_shared_factor() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: grouped
+      models: (qwen4b | qwen2b) & gemma_e2b
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        assert!(matrix.can_colocate(&m("qwen4b"), &m("gemma_e2b")));
+        assert!(matrix.can_colocate(&m("qwen2b"), &m("gemma_e2b")));
+        // The two alternatives never load together.
+        assert!(!matrix.can_colocate(&m("qwen4b"), &m("qwen2b")));
+    }
+
+    #[test]
+    fn full_llama_swap_config_ignores_unrelated_keys() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+healthCheckTimeout: 90
+models:
+  qwen9b-co:
+    cmd: llama-server -m qwen9b.gguf
+  minimax:
+    cmd: llama-server -m minimax.gguf
+groups:
+  default:
+    - qwen9b-co
+matrix:
+  sets:
+    - name: pair
+      models: qwen9b-co & qwen35_a3b-co
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        // Model ids carry the `-co` colocation suffix verbatim from the config.
+        assert!(matrix.can_colocate(&m("qwen9b-co"), &m("qwen35_a3b-co")));
+        assert!(!matrix.can_colocate(&m("qwen9b-co"), &m("minimax")));
+    }
+
+    #[test]
+    fn config_without_matrix_block_parses_to_none() {
+        let parsed = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+healthCheckTimeout: 90
+models:
+  qwen9b:
+    cmd: llama-server -m qwen9b.gguf
+"#,
+        )
+        .expect("parse");
+
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn invalid_yaml_is_a_config_error() {
+        let result = LlamaSwapMatrixConfig::from_yaml_str("matrix: [unterminated");
+
+        assert!(matches!(result, Err(RuntimeError::Config(_))));
+    }
+
+    #[test]
+    fn from_yaml_file_reads_matrix_block() {
+        let path = std::env::temp_dir().join(format!("anemoi-matrix-{}.yaml", Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            "matrix:\n  sets:\n    - name: pair\n      models: qwen9b & qwen35_a3b\n",
+        )
+        .expect("write fixture");
+
+        let matrix = LlamaSwapMatrixConfig::from_yaml_file(&path)
+            .expect("parse")
+            .expect("matrix");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(matrix.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+    }
+
+    #[test]
+    fn adapter_can_colocate_false_without_matrix() {
+        let adapter =
+            LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), "http://localhost:8080")
+                .expect("adapter");
+
+        assert!(adapter.matrix().is_none());
+        assert!(!adapter.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+    }
+
+    #[test]
+    fn adapter_can_colocate_uses_matrix() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: pair
+      models: qwen9b & qwen35_a3b
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+        let adapter =
+            LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), "http://localhost:8080")
+                .expect("adapter")
+                .with_matrix_config(matrix);
+
+        assert!(adapter.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+        assert!(!adapter.can_colocate(&m("qwen9b"), &m("minimax")));
     }
 }
