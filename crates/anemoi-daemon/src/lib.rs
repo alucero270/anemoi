@@ -6,7 +6,7 @@ use anemoi_core::{
 use anemoi_policy::{EvictionCandidateResident, EvictionPlan, EvictionRequest, Scheduler};
 use anemoi_runtime::{
     DynRuntimeAdapter, ForwardedChatCompletion, LlamaCppAdapter, LlamaSwapAdapter,
-    MockRuntimeAdapter, OllamaAdapter,
+    LlamaSwapEventStream, MockRuntimeAdapter, OllamaAdapter,
 };
 use anemoi_telemetry::{DynDecisionLog, InMemoryDecisionLog};
 use axum::body::Body;
@@ -17,7 +17,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -278,6 +278,24 @@ impl StagingWorker {
         Ok(())
     }
 
+    /// Marks every `Pending` intent whose `background_model` is in `ready_models`
+    /// as `Completed`, returning the completed ids. This is the SSE-driven
+    /// completion path (issue #62): once the readiness stream reports a staged
+    /// model as ready, the intent is satisfied without calling the runtime.
+    pub async fn reconcile_ready(&self, ready_models: &HashSet<ModelId>) -> Vec<Uuid> {
+        let mut queue = self.queue.write().await;
+        let mut completed = Vec::new();
+        for intent in queue.iter_mut() {
+            if intent.state == StagingState::Pending
+                && ready_models.contains(&intent.background_model)
+            {
+                intent.mark_completed();
+                completed.push(intent.id);
+            }
+        }
+        completed
+    }
+
     pub async fn unblock_and_queue(
         &self,
         decision_id: Uuid,
@@ -397,6 +415,13 @@ pub struct AppState {
     decision_log: DynDecisionLog,
     reconciler: Reconciler,
     staging_worker: StagingWorker,
+    /// Live `/api/events` SSE subscribers for llama_swap runtimes. Held only to
+    /// keep the background tasks alive for the process lifetime — the tasks are
+    /// aborted when the last `AppState` clone drops. Shared via `Arc` so cloning
+    /// `AppState` (axum does this per request) does not abort them. Never read:
+    /// its sole purpose is ownership, so the SSE tasks live as long as the state.
+    #[allow(dead_code)]
+    event_streams: Arc<Vec<LlamaSwapEventStream>>,
     /// Test seam for the live-execute gate. `None` reads the real
     /// `ANEMOI_ENABLE_LIVE_EXECUTE` env var (production); `Some(_)` overrides it
     /// so tests can exercise the gate without mutating process-global state.
@@ -408,6 +433,7 @@ impl AppState {
         config.validate()?;
         let scheduler = Scheduler::new(config.clone());
         let mut runtimes = HashMap::new();
+        let mut event_streams = Vec::new();
 
         for (runtime_id, runtime) in &config.runtimes {
             let adapter: DynRuntimeAdapter = match runtime.adapter.as_str() {
@@ -440,6 +466,11 @@ impl AppState {
                     } else {
                         adapter
                     };
+                    // Subscribe to the push-based residency stream so inspect()
+                    // observes real load state. No-op outside a tokio runtime.
+                    if let Some(stream) = adapter.start_event_stream() {
+                        event_streams.push(stream);
+                    }
                     Arc::new(adapter)
                 }
                 "llama_cpp" | "llama_server" => {
@@ -472,6 +503,7 @@ impl AppState {
             decision_log,
             reconciler,
             staging_worker,
+            event_streams: Arc::new(event_streams),
             live_execute: None,
         })
     }
@@ -541,6 +573,7 @@ impl AppState {
             decision_log: Arc::new(InMemoryDecisionLog::default()),
             reconciler,
             staging_worker,
+            event_streams: Arc::new(Vec::new()),
             live_execute: None,
         })
     }
@@ -953,7 +986,33 @@ impl AppState {
         }
     }
 
+    /// Models the reconciliation cache currently reports as hot/serving — i.e.
+    /// ready to use. The residency comes from the push-updated `/api/events` SSE
+    /// cache by way of the last `inspect()` snapshots.
+    async fn ready_models(&self) -> HashSet<ModelId> {
+        self.reconciler
+            .get_snapshots()
+            .await
+            .into_iter()
+            .flat_map(|snapshot| snapshot.residents)
+            .filter(|resident| {
+                matches!(
+                    resident.state,
+                    ResidencyState::HotGpu | ResidencyState::Serving
+                )
+            })
+            .map(|resident| resident.model_id)
+            .collect()
+    }
+
     pub async fn run_staging_tick(&self) {
+        // A staged model the readiness stream already reports as ready needs no
+        // runtime call — complete those intents first (issue #62).
+        let ready_models = self.ready_models().await;
+        if !ready_models.is_empty() {
+            self.staging_worker.reconcile_ready(&ready_models).await;
+        }
+
         let pending = self.staging_worker.get_pending().await;
         for intent in pending {
             let runtime_id = intent.target_runtime.0.clone();
@@ -2144,6 +2203,109 @@ runtimes:
 
         let all = state.staging_worker.get_all().await;
         assert_eq!(all[0].state, StagingState::Completed);
+    }
+
+    #[tokio::test]
+    async fn reconcile_ready_completes_only_the_ready_models_intent() {
+        let worker = StagingWorker::new();
+
+        let mut ready_intent = StagingIntent::new(
+            Uuid::new_v4(),
+            None,
+            ModelId("granite8b".to_string()),
+            RuntimeId("swap_rt".to_string()),
+            "ready via SSE".to_string(),
+        );
+        ready_intent.mark_pending();
+        let ready_id = ready_intent.id;
+        worker.enqueue(ready_intent).await;
+
+        let mut loading_intent = StagingIntent::new(
+            Uuid::new_v4(),
+            None,
+            ModelId("minimax".to_string()),
+            RuntimeId("swap_rt".to_string()),
+            "still loading".to_string(),
+        );
+        loading_intent.mark_pending();
+        worker.enqueue(loading_intent).await;
+
+        let ready: HashSet<ModelId> = [ModelId("granite8b".to_string())].into_iter().collect();
+        let completed = worker.reconcile_ready(&ready).await;
+
+        assert_eq!(completed, vec![ready_id]);
+        let all = worker.get_all().await;
+        let granite = all
+            .iter()
+            .find(|i| i.background_model == ModelId("granite8b".to_string()))
+            .expect("granite intent");
+        assert_eq!(granite.state, StagingState::Completed);
+        let minimax = all
+            .iter()
+            .find(|i| i.background_model == ModelId("minimax".to_string()))
+            .expect("minimax intent");
+        assert_eq!(
+            minimax.state,
+            StagingState::Pending,
+            "a model not yet ready must remain pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_tick_completes_intent_from_readiness_without_live_execute() {
+        // Runtime typed non-mock so the runtime-load path is gated off, but
+        // backed by a mock adapter that reports the staged model hot — i.e. what
+        // the `/api/events` SSE cache produces via inspect().
+        let mut config = example_config();
+        let swap_rt = RuntimeId("swap_rt".to_string());
+        config.runtimes.insert(
+            swap_rt.clone(),
+            RuntimeConfig {
+                adapter: "llama_swap".to_string(),
+                base_url: Some("http://127.0.0.1:9".to_string()),
+                auth_token: None,
+                initial_residents: vec![],
+            },
+        );
+
+        let mut residents = HashMap::new();
+        residents.insert(
+            swap_rt.to_string(),
+            vec![ModelResident {
+                model_id: ModelId("granite8b".to_string()),
+                state: ResidencyState::HotGpu,
+                vram_mb: None,
+                ram_mb: None,
+                kv_cache_mb: None,
+                loaded_since: None,
+            }],
+        );
+        let state = AppState::with_mock_residents(config, residents)
+            .expect("state")
+            .with_live_execute(false);
+
+        state
+            .staging_worker
+            .unblock_and_queue(
+                Uuid::new_v4(),
+                None,
+                ModelId("granite8b".to_string()),
+                swap_rt,
+                "ready via SSE cache".to_string(),
+            )
+            .await;
+
+        // Populate the reconciler cache from inspect (mock reports granite8b hot).
+        state.run_reconciliation_tick().await;
+        state.run_staging_tick().await;
+
+        let all = state.staging_worker.get_all().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].state,
+            StagingState::Completed,
+            "the readiness cache must complete the intent even with the live-load gate closed"
+        );
     }
 
     #[tokio::test]
