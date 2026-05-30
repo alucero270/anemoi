@@ -41,6 +41,14 @@ pub struct ExecutionHandle {
 pub trait RuntimeAdapter: Send + Sync {
     fn id(&self) -> RuntimeId;
 
+    /// Whether this adapter is an in-memory mock. Live adapters (Ollama,
+    /// llama-swap, llama.cpp) leave this `false`, letting callers that only hold
+    /// a `&DynRuntimeAdapter` — with no access to runtime config — refuse to
+    /// mutate a real runtime unless `ANEMOI_ENABLE_LIVE_EXECUTE=1` is set.
+    fn is_mock(&self) -> bool {
+        false
+    }
+
     async fn inspect(&self) -> Result<RuntimeSnapshot, RuntimeError>;
 
     async fn load_model(&self, model: &ModelId) -> Result<LoadHandle, RuntimeError>;
@@ -110,6 +118,10 @@ impl MockRuntimeAdapter {
 impl RuntimeAdapter for MockRuntimeAdapter {
     fn id(&self) -> RuntimeId {
         self.id.clone()
+    }
+
+    fn is_mock(&self) -> bool {
+        true
     }
 
     async fn inspect(&self) -> Result<RuntimeSnapshot, RuntimeError> {

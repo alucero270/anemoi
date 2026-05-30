@@ -345,3 +345,24 @@ the subscribers in an `Arc<Vec<LlamaSwapEventStream>>` whose final drop aborts
 the tasks. `StagingWorker::reconcile_ready` then completes a pending staging
 intent the moment its background model is observed `HotGpu`/`Serving`, so
 staging closes from real readiness rather than a mock execute.
+
+Issue #49 (staging live-execute gate) closed a bypass found in the prompt 20
+controlled-execution review of #37:
+
+- `execute_pending_skips_live_runtime_without_enable_flag` (`anemoi-daemon`)
+
+`StagingWorker::execute_pending` called `runtime.load_model` directly with no
+`ANEMOI_ENABLE_LIVE_EXECUTE` guard, so any caller passing a live adapter could
+mutate a real runtime even with the opt-in absent — the daemon's own
+`run_staging_tick` gated correctly but the lower-level worker method did not.
+The fix gates `execute_pending` exactly like the tick: load is permitted only
+when the adapter is a mock or `ANEMOI_ENABLE_LIVE_EXECUTE=1`. Because the method
+holds only a `&DynRuntimeAdapter` (no runtime config), mock-ness now comes from
+a new `RuntimeAdapter::is_mock()` trait method (default `false`, `true` only on
+`MockRuntimeAdapter`) rather than a config lookup. A gated intent is left
+`Pending` — *not* dead-ended — so the SSE-readiness path (`reconcile_ready`) can
+still complete it if the model becomes resident by other means, identical to how
+`run_staging_tick` leaves gated intents pending. The required test drives a
+non-mock spy adapter that counts `load_model` calls and asserts the count stays
+`0` (load was *not* called) and the intent stays `Pending`, rather than
+asserting `is_ok`.

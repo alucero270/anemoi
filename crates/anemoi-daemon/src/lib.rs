@@ -316,6 +316,18 @@ impl StagingWorker {
     }
 
     pub async fn execute_pending(&self, runtime: &DynRuntimeAdapter) -> anyhow::Result<()> {
+        // Loading a model mutates a real runtime, so it is gated exactly like the
+        // daemon's reconciliation tick (`run_staging_tick`): a load may fire only
+        // for a mock adapter or when `ANEMOI_ENABLE_LIVE_EXECUTE=1` is set. With
+        // the gate closed the pending intents are left untouched — still
+        // `Pending`, so the SSE-readiness path (`reconcile_ready`) can still
+        // complete them if the model becomes resident by other means — rather
+        // than dead-ended. Mock-ness comes from the adapter itself (`is_mock()`)
+        // because this method holds only the adapter, not the runtime config that
+        // `run_staging_tick` consults via `runtime_adapter_type`.
+        if !runtime.is_mock() && !live_execution_enabled() {
+            return Ok(());
+        }
         let pending = self.get_pending().await;
         for intent in pending {
             match runtime.load_model(&intent.background_model).await {
@@ -2032,6 +2044,97 @@ mod tests {
         assert_eq!(
             completed.background_model,
             ModelId("qwen35_a3b".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_pending_skips_live_runtime_without_enable_flag() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A live (non-mock) adapter that records every load_model call. It wraps a
+        // mock for the other trait methods but does NOT override is_mock(), so it
+        // presents as a real runtime — exactly the case the gate must refuse.
+        struct LoadCountingAdapter {
+            inner: DynRuntimeAdapter,
+            loads: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl anemoi_runtime::RuntimeAdapter for LoadCountingAdapter {
+            fn id(&self) -> RuntimeId {
+                self.inner.id()
+            }
+            async fn inspect(&self) -> Result<RuntimeSnapshot, anemoi_runtime::RuntimeError> {
+                self.inner.inspect().await
+            }
+            async fn load_model(
+                &self,
+                model: &ModelId,
+            ) -> Result<anemoi_runtime::LoadHandle, anemoi_runtime::RuntimeError> {
+                self.loads.fetch_add(1, Ordering::SeqCst);
+                self.inner.load_model(model).await
+            }
+            async fn unload_model(
+                &self,
+                model: &ModelId,
+            ) -> Result<(), anemoi_runtime::RuntimeError> {
+                self.inner.unload_model(model).await
+            }
+            async fn execute(
+                &self,
+                request: anemoi_core::ExecutionRequest,
+            ) -> Result<anemoi_runtime::ExecutionHandle, anemoi_runtime::RuntimeError> {
+                self.inner.execute(request).await
+            }
+        }
+
+        let loads = Arc::new(AtomicUsize::new(0));
+        let runtime: DynRuntimeAdapter = Arc::new(LoadCountingAdapter {
+            inner: Arc::new(MockRuntimeAdapter::new(
+                RuntimeId("llama_swap".to_string()),
+                Vec::new(),
+            )),
+            loads: loads.clone(),
+        });
+        assert!(
+            !runtime.is_mock(),
+            "spy adapter must present as a live runtime for this gate test"
+        );
+
+        let worker = StagingWorker::new();
+        let mut intent = StagingIntent::new(
+            Uuid::new_v4(),
+            Some(ModelId("qwen9b".to_string())),
+            ModelId("qwen35_a3b".to_string()),
+            runtime.id(),
+            "background staging test".to_string(),
+        );
+        intent.mark_pending();
+        let intent_id = intent.id;
+        worker.enqueue(intent).await;
+
+        worker
+            .execute_pending(&runtime)
+            .await
+            .expect("execute_pending should not error when gated");
+
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            0,
+            "load_model must NOT be called on a non-mock runtime without ANEMOI_ENABLE_LIVE_EXECUTE"
+        );
+
+        let intent = worker
+            .get_all()
+            .await
+            .into_iter()
+            .find(|i| i.id == intent_id)
+            .expect("intent should still be queued");
+        assert_eq!(
+            intent.state,
+            StagingState::Pending,
+            "a gated intent must stay Pending (not dead-ended) so the readiness \
+             path can still complete it — matching run_staging_tick"
         );
     }
 
