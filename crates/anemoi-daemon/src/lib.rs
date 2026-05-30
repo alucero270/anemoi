@@ -6,9 +6,9 @@ use anemoi_core::{
 use anemoi_policy::{EvictionCandidateResident, EvictionPlan, EvictionRequest, Scheduler};
 use anemoi_runtime::{
     DynRuntimeAdapter, ForwardedChatCompletion, LlamaCppAdapter, LlamaSwapAdapter,
-    MockRuntimeAdapter, OllamaAdapter,
+    LlamaSwapEventStream, MockRuntimeAdapter, OllamaAdapter,
 };
-use anemoi_telemetry::{DynDecisionLog, InMemoryDecisionLog};
+use anemoi_telemetry::{DynDecisionLog, InMemoryDecisionLog, ResidentTransitionRecord};
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -17,8 +17,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
@@ -149,6 +150,59 @@ impl Default for Reconciler {
     }
 }
 
+/// A resident state transition detected between two consecutive reconciliation
+/// snapshots (issue #12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentTransitionDetail {
+    pub model_id: ModelId,
+    pub from_state: ResidencyState,
+    pub to_state: ResidencyState,
+    /// True when `to_state` is the first time this model is observed and
+    /// `from_state` was inferred as `Cold` rather than read from a prior
+    /// snapshot.
+    pub first_observation: bool,
+}
+
+/// Detects residency transitions between the previous and current snapshot's
+/// residents (issue #12).
+///
+/// A model present in `current` whose state differs from `previous` — or that
+/// is newly present — yields one transition. A newly present model's prior
+/// state is inferred as `Cold`: the established-vocabulary representation of
+/// "not resident". Issue #12 forbids inventing an `Unknown` variant, and `Cold`
+/// is the honest stand-in (the `first_observation` flag and an accompanying
+/// note mark it as inferred rather than observed).
+///
+/// Models that vanished from `current` produce no transition: their target
+/// state is not observed, and inferring one (cold? evicting?) would be
+/// speculative. Only observed states are recorded.
+fn resident_transitions(
+    previous: &[ModelResident],
+    current: &[ModelResident],
+) -> Vec<ResidentTransitionDetail> {
+    let prior: HashMap<&ModelId, &ResidencyState> =
+        previous.iter().map(|r| (&r.model_id, &r.state)).collect();
+    let mut transitions = Vec::new();
+    for resident in current {
+        match prior.get(&resident.model_id) {
+            Some(&prev) if *prev == resident.state => {}
+            Some(&prev) => transitions.push(ResidentTransitionDetail {
+                model_id: resident.model_id.clone(),
+                from_state: prev.clone(),
+                to_state: resident.state.clone(),
+                first_observation: false,
+            }),
+            None => transitions.push(ResidentTransitionDetail {
+                model_id: resident.model_id.clone(),
+                from_state: ResidencyState::Cold,
+                to_state: resident.state.clone(),
+                first_observation: true,
+            }),
+        }
+    }
+    transitions
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StagingState {
@@ -262,6 +316,18 @@ impl StagingWorker {
     }
 
     pub async fn execute_pending(&self, runtime: &DynRuntimeAdapter) -> anyhow::Result<()> {
+        // Loading a model mutates a real runtime, so it is gated exactly like the
+        // daemon's reconciliation tick (`run_staging_tick`): a load may fire only
+        // for a mock adapter or when `ANEMOI_ENABLE_LIVE_EXECUTE=1` is set. With
+        // the gate closed the pending intents are left untouched — still
+        // `Pending`, so the SSE-readiness path (`reconcile_ready`) can still
+        // complete them if the model becomes resident by other means — rather
+        // than dead-ended. Mock-ness comes from the adapter itself (`is_mock()`)
+        // because this method holds only the adapter, not the runtime config that
+        // `run_staging_tick` consults via `runtime_adapter_type`.
+        if !runtime.is_mock() && !live_execution_enabled() {
+            return Ok(());
+        }
         let pending = self.get_pending().await;
         for intent in pending {
             match runtime.load_model(&intent.background_model).await {
@@ -276,6 +342,24 @@ impl StagingWorker {
             }
         }
         Ok(())
+    }
+
+    /// Marks every `Pending` intent whose `background_model` is in `ready_models`
+    /// as `Completed`, returning the completed ids. This is the SSE-driven
+    /// completion path (issue #62): once the readiness stream reports a staged
+    /// model as ready, the intent is satisfied without calling the runtime.
+    pub async fn reconcile_ready(&self, ready_models: &HashSet<ModelId>) -> Vec<Uuid> {
+        let mut queue = self.queue.write().await;
+        let mut completed = Vec::new();
+        for intent in queue.iter_mut() {
+            if intent.state == StagingState::Pending
+                && ready_models.contains(&intent.background_model)
+            {
+                intent.mark_completed();
+                completed.push(intent.id);
+            }
+        }
+        completed
     }
 
     pub async fn unblock_and_queue(
@@ -397,6 +481,17 @@ pub struct AppState {
     decision_log: DynDecisionLog,
     reconciler: Reconciler,
     staging_worker: StagingWorker,
+    /// Live `/api/events` SSE subscribers for llama_swap runtimes. Held only to
+    /// keep the background tasks alive for the process lifetime — the tasks are
+    /// aborted when the last `AppState` clone drops. Shared via `Arc` so cloning
+    /// `AppState` (axum does this per request) does not abort them. Never read:
+    /// its sole purpose is ownership, so the SSE tasks live as long as the state.
+    #[allow(dead_code)]
+    event_streams: Arc<Vec<LlamaSwapEventStream>>,
+    /// Monotonic reconciliation tick counter. Stamped into the
+    /// `evidence_source` of resident events so each transition records which
+    /// inspection round observed it (issue #12).
+    reconciliation_round: Arc<AtomicU64>,
     /// Test seam for the live-execute gate. `None` reads the real
     /// `ANEMOI_ENABLE_LIVE_EXECUTE` env var (production); `Some(_)` overrides it
     /// so tests can exercise the gate without mutating process-global state.
@@ -408,6 +503,7 @@ impl AppState {
         config.validate()?;
         let scheduler = Scheduler::new(config.clone());
         let mut runtimes = HashMap::new();
+        let mut event_streams = Vec::new();
 
         for (runtime_id, runtime) in &config.runtimes {
             let adapter: DynRuntimeAdapter = match runtime.adapter.as_str() {
@@ -440,6 +536,19 @@ impl AppState {
                     } else {
                         adapter
                     };
+                    // Read the matrix block from the llama-swap YAML, if a path
+                    // is configured, so the adapter can answer colocation
+                    // questions. Absent or unset leaves matrix awareness off.
+                    let adapter = if let Some(path) = &runtime.config_path {
+                        adapter.with_matrix_config_path(path)?
+                    } else {
+                        adapter
+                    };
+                    // Subscribe to the push-based residency stream so inspect()
+                    // observes real load state. No-op outside a tokio runtime.
+                    if let Some(stream) = adapter.start_event_stream() {
+                        event_streams.push(stream);
+                    }
                     Arc::new(adapter)
                 }
                 "llama_cpp" | "llama_server" => {
@@ -472,6 +581,8 @@ impl AppState {
             decision_log,
             reconciler,
             staging_worker,
+            event_streams: Arc::new(event_streams),
+            reconciliation_round: Arc::new(AtomicU64::new(0)),
             live_execute: None,
         })
     }
@@ -541,6 +652,8 @@ impl AppState {
             decision_log: Arc::new(InMemoryDecisionLog::default()),
             reconciler,
             staging_worker,
+            event_streams: Arc::new(Vec::new()),
+            reconciliation_round: Arc::new(AtomicU64::new(0)),
             live_execute: None,
         })
     }
@@ -939,9 +1052,22 @@ impl AppState {
     }
 
     pub async fn run_reconciliation_tick(&self) {
+        let round = self.reconciliation_round.fetch_add(1, Ordering::Relaxed) + 1;
         for (runtime_id, adapter) in &self.runtimes {
             match adapter.inspect().await {
                 Ok(snapshot) => {
+                    let previous = self.reconciler.get(runtime_id).await;
+                    let prior_residents = previous
+                        .as_ref()
+                        .map(|p| p.snapshot.residents.as_slice())
+                        .unwrap_or(&[]);
+                    self.emit_resident_transitions(
+                        runtime_id,
+                        prior_residents,
+                        &snapshot.residents,
+                        round,
+                    )
+                    .await;
                     self.reconciler.update(runtime_id, snapshot).await;
                 }
                 Err(e) => {
@@ -953,7 +1079,72 @@ impl AppState {
         }
     }
 
+    /// Models the reconciliation cache currently reports as hot/serving — i.e.
+    /// ready to use. The residency comes from the push-updated `/api/events` SSE
+    /// cache by way of the last `inspect()` snapshots.
+    async fn ready_models(&self) -> HashSet<ModelId> {
+        self.reconciler
+            .get_snapshots()
+            .await
+            .into_iter()
+            .flat_map(|snapshot| snapshot.residents)
+            .filter(|resident| {
+                matches!(
+                    resident.state,
+                    ResidencyState::HotGpu | ResidencyState::Serving
+                )
+            })
+            .map(|resident| resident.model_id)
+            .collect()
+    }
+
+    /// Records resident transitions for one runtime into the durable event
+    /// store (issue #12). Reconciliation is observation-only, so every
+    /// transition is recorded with `decision_id = None`; the `evidence_source`
+    /// names the adapter and inspection round so no transition is anonymous.
+    /// Recording is best-effort — a telemetry error must not abort the tick.
+    async fn emit_resident_transitions(
+        &self,
+        runtime_id: &str,
+        previous: &[ModelResident],
+        current: &[ModelResident],
+        round: u64,
+    ) {
+        let transitions = resident_transitions(previous, current);
+        if transitions.is_empty() {
+            return;
+        }
+        let adapter = self.runtime_adapter_type(runtime_id).unwrap_or("unknown");
+        let evidence = format!("{adapter} reconciliation round {round}");
+        let observed_at = Utc::now();
+        for transition in &transitions {
+            let note = transition
+                .first_observation
+                .then_some("first observation; prior state inferred as cold");
+            let _ = self
+                .decision_log
+                .record_resident_transition(ResidentTransitionRecord {
+                    model_id: transition.model_id.0.as_str(),
+                    runtime_id,
+                    from_state: transition.from_state.clone(),
+                    to_state: transition.to_state.clone(),
+                    observed_at,
+                    evidence_source: &evidence,
+                    decision_id: None,
+                    note,
+                })
+                .await;
+        }
+    }
+
     pub async fn run_staging_tick(&self) {
+        // A staged model the readiness stream already reports as ready needs no
+        // runtime call — complete those intents first (issue #62).
+        let ready_models = self.ready_models().await;
+        if !ready_models.is_empty() {
+            self.staging_worker.reconcile_ready(&ready_models).await;
+        }
+
         let pending = self.staging_worker.get_pending().await;
         for intent in pending {
             let runtime_id = intent.target_runtime.0.clone();
@@ -1359,6 +1550,7 @@ mod tests {
                 base_url: Some("http://127.0.0.1:8085".to_string()),
                 auth_token: None,
                 initial_residents: Vec::new(),
+                config_path: None,
             },
         );
         // Add a model that references the new runtime.
@@ -1560,6 +1752,99 @@ mod tests {
             !snapshot.snapshot.available,
             "snapshot should be marked unavailable"
         );
+    }
+
+    #[test]
+    fn resident_transitions_detects_first_observation_change_and_skips_unchanged() {
+        let model = |id: &str, state: ResidencyState| ModelResident {
+            model_id: ModelId(id.to_string()),
+            state,
+            vram_mb: None,
+            ram_mb: None,
+            kv_cache_mb: None,
+            loaded_since: None,
+        };
+
+        // First observation: no prior snapshot → from_state inferred as Cold.
+        let first = resident_transitions(&[], &[model("qwen9b", ResidencyState::HotGpu)]);
+        assert_eq!(
+            first,
+            vec![ResidentTransitionDetail {
+                model_id: ModelId("qwen9b".to_string()),
+                from_state: ResidencyState::Cold,
+                to_state: ResidencyState::HotGpu,
+                first_observation: true,
+            }]
+        );
+
+        // State change between ticks: from_state is the observed prior state.
+        let changed = resident_transitions(
+            &[model("qwen9b", ResidencyState::Loading)],
+            &[model("qwen9b", ResidencyState::HotGpu)],
+        );
+        assert_eq!(
+            changed,
+            vec![ResidentTransitionDetail {
+                model_id: ModelId("qwen9b".to_string()),
+                from_state: ResidencyState::Loading,
+                to_state: ResidencyState::HotGpu,
+                first_observation: false,
+            }]
+        );
+
+        // Unchanged state records no transition (absence is the behavior).
+        let unchanged = resident_transitions(
+            &[model("qwen9b", ResidencyState::HotGpu)],
+            &[model("qwen9b", ResidencyState::HotGpu)],
+        );
+        assert!(unchanged.is_empty());
+
+        // A vanished resident records no transition: its target state is not
+        // observed, so inferring one would be speculative.
+        let vanished = resident_transitions(&[model("qwen9b", ResidencyState::HotGpu)], &[]);
+        assert!(vanished.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_tick_records_resident_transition() {
+        // Issue #12: the reconciliation loop emits resident_events reachable
+        // from the daemon (not just the telemetry unit test). The example
+        // config's mock runtime starts with qwen9b hot_gpu, so the first tick
+        // records a single cold → hot_gpu transition; a second tick with no
+        // change records nothing.
+        let db_path =
+            std::env::temp_dir().join(format!("anemoi-resident-events-{}.db", Uuid::new_v4()));
+        let store = Arc::new(SqliteEventStore::create(&db_path).expect("sqlite event store"));
+        let state = AppState::new(example_config(), store.clone()).expect("state");
+
+        state.run_reconciliation_tick().await;
+
+        let events = store.resident_events("qwen9b").expect("resident events");
+        assert_eq!(events.len(), 1, "first tick records one transition");
+        let event = &events[0];
+        assert_eq!(event.from_state, "cold");
+        assert_eq!(event.to_state, "hot_gpu");
+        assert_eq!(event.runtime_id, "mock");
+        assert_eq!(
+            event.decision_id, None,
+            "reconciliation is observation-only"
+        );
+        assert_eq!(
+            event.note.as_deref(),
+            Some("first observation; prior state inferred as cold")
+        );
+        assert!(
+            event.evidence_source.contains("reconciliation round 1"),
+            "evidence names the inspection round, got {:?}",
+            event.evidence_source
+        );
+
+        // Second tick: qwen9b is unchanged, so no new transition is recorded.
+        state.run_reconciliation_tick().await;
+        let events = store.resident_events("qwen9b").expect("resident events");
+        assert_eq!(events.len(), 1, "unchanged state records no new transition");
+
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[tokio::test]
@@ -1768,6 +2053,97 @@ mod tests {
         assert_eq!(
             completed.background_model,
             ModelId("qwen35_a3b".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_pending_skips_live_runtime_without_enable_flag() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A live (non-mock) adapter that records every load_model call. It wraps a
+        // mock for the other trait methods but does NOT override is_mock(), so it
+        // presents as a real runtime — exactly the case the gate must refuse.
+        struct LoadCountingAdapter {
+            inner: DynRuntimeAdapter,
+            loads: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl anemoi_runtime::RuntimeAdapter for LoadCountingAdapter {
+            fn id(&self) -> RuntimeId {
+                self.inner.id()
+            }
+            async fn inspect(&self) -> Result<RuntimeSnapshot, anemoi_runtime::RuntimeError> {
+                self.inner.inspect().await
+            }
+            async fn load_model(
+                &self,
+                model: &ModelId,
+            ) -> Result<anemoi_runtime::LoadHandle, anemoi_runtime::RuntimeError> {
+                self.loads.fetch_add(1, Ordering::SeqCst);
+                self.inner.load_model(model).await
+            }
+            async fn unload_model(
+                &self,
+                model: &ModelId,
+            ) -> Result<(), anemoi_runtime::RuntimeError> {
+                self.inner.unload_model(model).await
+            }
+            async fn execute(
+                &self,
+                request: anemoi_core::ExecutionRequest,
+            ) -> Result<anemoi_runtime::ExecutionHandle, anemoi_runtime::RuntimeError> {
+                self.inner.execute(request).await
+            }
+        }
+
+        let loads = Arc::new(AtomicUsize::new(0));
+        let runtime: DynRuntimeAdapter = Arc::new(LoadCountingAdapter {
+            inner: Arc::new(MockRuntimeAdapter::new(
+                RuntimeId("llama_swap".to_string()),
+                Vec::new(),
+            )),
+            loads: loads.clone(),
+        });
+        assert!(
+            !runtime.is_mock(),
+            "spy adapter must present as a live runtime for this gate test"
+        );
+
+        let worker = StagingWorker::new();
+        let mut intent = StagingIntent::new(
+            Uuid::new_v4(),
+            Some(ModelId("qwen9b".to_string())),
+            ModelId("qwen35_a3b".to_string()),
+            runtime.id(),
+            "background staging test".to_string(),
+        );
+        intent.mark_pending();
+        let intent_id = intent.id;
+        worker.enqueue(intent).await;
+
+        worker
+            .execute_pending(&runtime)
+            .await
+            .expect("execute_pending should not error when gated");
+
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            0,
+            "load_model must NOT be called on a non-mock runtime without ANEMOI_ENABLE_LIVE_EXECUTE"
+        );
+
+        let intent = worker
+            .get_all()
+            .await
+            .into_iter()
+            .find(|i| i.id == intent_id)
+            .expect("intent should still be queued");
+        assert_eq!(
+            intent.state,
+            StagingState::Pending,
+            "a gated intent must stay Pending (not dead-ended) so the readiness \
+             path can still complete it — matching run_staging_tick"
         );
     }
 
@@ -2147,6 +2523,110 @@ runtimes:
     }
 
     #[tokio::test]
+    async fn reconcile_ready_completes_only_the_ready_models_intent() {
+        let worker = StagingWorker::new();
+
+        let mut ready_intent = StagingIntent::new(
+            Uuid::new_v4(),
+            None,
+            ModelId("granite8b".to_string()),
+            RuntimeId("swap_rt".to_string()),
+            "ready via SSE".to_string(),
+        );
+        ready_intent.mark_pending();
+        let ready_id = ready_intent.id;
+        worker.enqueue(ready_intent).await;
+
+        let mut loading_intent = StagingIntent::new(
+            Uuid::new_v4(),
+            None,
+            ModelId("minimax".to_string()),
+            RuntimeId("swap_rt".to_string()),
+            "still loading".to_string(),
+        );
+        loading_intent.mark_pending();
+        worker.enqueue(loading_intent).await;
+
+        let ready: HashSet<ModelId> = [ModelId("granite8b".to_string())].into_iter().collect();
+        let completed = worker.reconcile_ready(&ready).await;
+
+        assert_eq!(completed, vec![ready_id]);
+        let all = worker.get_all().await;
+        let granite = all
+            .iter()
+            .find(|i| i.background_model == ModelId("granite8b".to_string()))
+            .expect("granite intent");
+        assert_eq!(granite.state, StagingState::Completed);
+        let minimax = all
+            .iter()
+            .find(|i| i.background_model == ModelId("minimax".to_string()))
+            .expect("minimax intent");
+        assert_eq!(
+            minimax.state,
+            StagingState::Pending,
+            "a model not yet ready must remain pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_tick_completes_intent_from_readiness_without_live_execute() {
+        // Runtime typed non-mock so the runtime-load path is gated off, but
+        // backed by a mock adapter that reports the staged model hot — i.e. what
+        // the `/api/events` SSE cache produces via inspect().
+        let mut config = example_config();
+        let swap_rt = RuntimeId("swap_rt".to_string());
+        config.runtimes.insert(
+            swap_rt.clone(),
+            RuntimeConfig {
+                adapter: "llama_swap".to_string(),
+                base_url: Some("http://127.0.0.1:9".to_string()),
+                auth_token: None,
+                initial_residents: vec![],
+                config_path: None,
+            },
+        );
+
+        let mut residents = HashMap::new();
+        residents.insert(
+            swap_rt.to_string(),
+            vec![ModelResident {
+                model_id: ModelId("granite8b".to_string()),
+                state: ResidencyState::HotGpu,
+                vram_mb: None,
+                ram_mb: None,
+                kv_cache_mb: None,
+                loaded_since: None,
+            }],
+        );
+        let state = AppState::with_mock_residents(config, residents)
+            .expect("state")
+            .with_live_execute(false);
+
+        state
+            .staging_worker
+            .unblock_and_queue(
+                Uuid::new_v4(),
+                None,
+                ModelId("granite8b".to_string()),
+                swap_rt,
+                "ready via SSE cache".to_string(),
+            )
+            .await;
+
+        // Populate the reconciler cache from inspect (mock reports granite8b hot).
+        state.run_reconciliation_tick().await;
+        state.run_staging_tick().await;
+
+        let all = state.staging_worker.get_all().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].state,
+            StagingState::Completed,
+            "the readiness cache must complete the intent even with the live-load gate closed"
+        );
+    }
+
+    #[tokio::test]
     async fn staging_tick_skips_intent_with_unknown_runtime() {
         let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
             .expect("state");
@@ -2187,6 +2667,7 @@ runtimes:
                 base_url: Some("http://127.0.0.1:11434".to_string()),
                 auth_token: None,
                 initial_residents: vec![],
+                config_path: None,
             },
         );
 

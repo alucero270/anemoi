@@ -367,6 +367,11 @@ pub struct RuntimeConfig {
     pub auth_token: Option<String>,
     #[serde(default)]
     pub initial_residents: Vec<RuntimeResidentConfig>,
+    /// Path to the runtime's own config file, read for adapter-specific
+    /// metadata not exposed over the wire. For the `llama_swap` adapter this is
+    /// the llama-swap YAML whose `matrix` block declares colocation sets.
+    #[serde(default)]
+    pub config_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

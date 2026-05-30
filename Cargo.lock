@@ -128,8 +128,10 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

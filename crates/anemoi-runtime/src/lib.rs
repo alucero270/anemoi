@@ -8,7 +8,8 @@ use futures::stream::{BoxStream, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Url;
 use serde::Deserialize;
-use std::sync::{Arc, RwLock};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -22,6 +23,8 @@ pub enum RuntimeError {
     Url(String),
     #[error("runtime operation is not supported: {0}")]
     Unsupported(&'static str),
+    #[error("failed to load llama-swap config: {0}")]
+    Config(String),
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,14 @@ pub struct ExecutionHandle {
 #[async_trait]
 pub trait RuntimeAdapter: Send + Sync {
     fn id(&self) -> RuntimeId;
+
+    /// Whether this adapter is an in-memory mock. Live adapters (Ollama,
+    /// llama-swap, llama.cpp) leave this `false`, letting callers that only hold
+    /// a `&DynRuntimeAdapter` — with no access to runtime config — refuse to
+    /// mutate a real runtime unless `ANEMOI_ENABLE_LIVE_EXECUTE=1` is set.
+    fn is_mock(&self) -> bool {
+        false
+    }
 
     async fn inspect(&self) -> Result<RuntimeSnapshot, RuntimeError>;
 
@@ -109,6 +120,10 @@ impl MockRuntimeAdapter {
 impl RuntimeAdapter for MockRuntimeAdapter {
     fn id(&self) -> RuntimeId {
         self.id.clone()
+    }
+
+    fn is_mock(&self) -> bool {
+        true
     }
 
     async fn inspect(&self) -> Result<RuntimeSnapshot, RuntimeError> {
@@ -408,6 +423,15 @@ pub struct LlamaSwapAdapter {
     base_url: Url,
     client: reqwest::Client,
     auth_token: Option<String>,
+    /// Push-updated model residency, maintained by [`LlamaSwapEventStream`]
+    /// from the `/api/events` SSE stream. Shared (cloned `Arc`) with any event
+    /// stream started off this adapter, so `inspect` observes live state.
+    model_states: ModelStateCache,
+    /// Parsed `matrix` block from the llama-swap YAML, when a config path was
+    /// supplied via [`LlamaSwapAdapter::with_matrix_config_path`]. `None` means
+    /// matrix awareness is disabled and [`LlamaSwapAdapter::can_colocate`]
+    /// conservatively reports that no two models are known to colocate.
+    matrix: Option<LlamaSwapMatrixConfig>,
 }
 
 impl LlamaSwapAdapter {
@@ -425,12 +449,75 @@ impl LlamaSwapAdapter {
             base_url: Url::parse(base_url).map_err(|error| RuntimeError::Url(error.to_string()))?,
             client: reqwest::Client::builder().timeout(timeout).build()?,
             auth_token: None,
+            model_states: Arc::new(RwLock::new(HashMap::new())),
+            matrix: None,
         })
     }
 
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(token.into());
         self
+    }
+
+    /// Reads and parses the `matrix` block from the llama-swap YAML config at
+    /// `path`, enabling colocation awareness via
+    /// [`LlamaSwapAdapter::can_colocate`]. A config file without a `matrix`
+    /// block parses successfully and leaves matrix awareness disabled. Returns
+    /// [`RuntimeError::Config`] when the file cannot be read or parsed.
+    pub fn with_matrix_config_path(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, RuntimeError> {
+        self.matrix = LlamaSwapMatrixConfig::from_yaml_file(path)?;
+        Ok(self)
+    }
+
+    /// Sets the parsed matrix config directly. Primarily for callers that have
+    /// already loaded the config; most code should prefer
+    /// [`LlamaSwapAdapter::with_matrix_config_path`].
+    pub fn with_matrix_config(mut self, matrix: LlamaSwapMatrixConfig) -> Self {
+        self.matrix = Some(matrix);
+        self
+    }
+
+    /// The parsed matrix config, or `None` when matrix awareness is disabled.
+    pub fn matrix(&self) -> Option<&LlamaSwapMatrixConfig> {
+        self.matrix.as_ref()
+    }
+
+    /// Whether `a` and `b` can be GPU-resident at the same time according to the
+    /// llama-swap matrix colocation sets. Returns `false` when matrix awareness
+    /// is disabled (no config supplied) — absent a declared colocation set, the
+    /// safe assumption is that loading one model evicts the other.
+    pub fn can_colocate(&self, a: &ModelId, b: &ModelId) -> bool {
+        self.matrix
+            .as_ref()
+            .is_some_and(|matrix| matrix.can_colocate(a, b))
+    }
+
+    /// Read handle to the push-updated model-state cache. Empty until an event
+    /// stream is started via [`LlamaSwapAdapter::start_event_stream`] and the
+    /// first `modelStatus` frame arrives.
+    pub fn model_states(&self) -> ModelStateCache {
+        Arc::clone(&self.model_states)
+    }
+
+    /// Spawns the `/api/events` SSE subscriber on the current tokio runtime,
+    /// returning a handle that keeps the background task alive (the task is
+    /// aborted when the handle is dropped). Returns `None` when called outside a
+    /// tokio runtime (e.g. synchronous tests), leaving the cache empty rather
+    /// than panicking. The spawned task shares this adapter's cache, so
+    /// [`LlamaSwapAdapter::inspect`] reflects what the stream observes.
+    pub fn start_event_stream(&self) -> Option<LlamaSwapEventStream> {
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let events_url = self.base_url.join("/api/events").ok()?;
+        let cache = Arc::clone(&self.model_states);
+        let handle = runtime.spawn(run_event_stream(
+            events_url,
+            self.auth_token.clone(),
+            Arc::clone(&cache),
+        ));
+        Some(LlamaSwapEventStream { cache, handle })
     }
 
     pub async fn inspect_models(&self) -> Result<Vec<ModelId>, RuntimeError> {
@@ -465,6 +552,202 @@ impl LlamaSwapAdapter {
     }
 }
 
+/// The `matrix` block of a llama-swap YAML config. llama-swap does not expose
+/// this over its API, so Anemoi reads the file directly (both run on the same
+/// host). Anemoi reads the colocation sets to answer feasibility questions; it
+/// does not re-implement llama-swap's matrix solver, so `vars` and
+/// `evict_costs` are retained verbatim for callers that want the raw numbers.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct LlamaSwapMatrixConfig {
+    /// Free-form numeric variables (e.g. `gpu: 24576` for total VRAM in MB).
+    #[serde(default)]
+    pub vars: HashMap<String, u64>,
+    /// Per-model cold-load cost estimates in milliseconds, keyed by model id.
+    #[serde(default)]
+    pub evict_costs: HashMap<String, u64>,
+    /// Declared colocation sets. Each set's `models` expression names the
+    /// models that may be GPU-resident together.
+    #[serde(default)]
+    pub sets: Vec<ColocationSet>,
+}
+
+/// One named colocation set. `models` is a llama-swap matrix DSL expression
+/// over model ids using `&` (colocate / AND), `|` (alternative / OR), and
+/// parentheses for grouping — e.g. `qwen9b & qwen35_a3b` or
+/// `(qwen9b | qwen4b) & gemma`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ColocationSet {
+    pub name: String,
+    pub models: String,
+}
+
+/// Wrapper that picks only the `matrix` block out of a full llama-swap config
+/// file. Every other top-level key (models, groups, healthCheckTimeout, ...) is
+/// ignored, so the same parser tolerates an arbitrary llama-swap config.
+#[derive(Debug, Deserialize)]
+struct LlamaSwapConfigFile {
+    #[serde(default)]
+    matrix: Option<LlamaSwapMatrixConfig>,
+}
+
+impl LlamaSwapMatrixConfig {
+    /// Parses the `matrix` block out of the llama-swap YAML at `path`. Returns
+    /// `Ok(None)` when the file parses but declares no `matrix` block.
+    pub fn from_yaml_file(path: impl AsRef<std::path::Path>) -> Result<Option<Self>, RuntimeError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| RuntimeError::Config(error.to_string()))?;
+        Self::from_yaml_str(&text)
+    }
+
+    /// Parses the `matrix` block out of a llama-swap YAML string. Returns
+    /// `Ok(None)` when the document parses but declares no `matrix` block.
+    pub fn from_yaml_str(text: &str) -> Result<Option<Self>, RuntimeError> {
+        let file: LlamaSwapConfigFile =
+            serde_yaml::from_str(text).map_err(|error| RuntimeError::Config(error.to_string()))?;
+        Ok(file.matrix)
+    }
+
+    /// Whether `a` and `b` may be GPU-resident at the same time: `true` when
+    /// some colocation set admits a loadout containing both. Models joined only
+    /// by `|` are alternatives and do not colocate on that basis.
+    pub fn can_colocate(&self, a: &ModelId, b: &ModelId) -> bool {
+        self.sets
+            .iter()
+            .flat_map(|set| set.loadouts())
+            .any(|loadout| loadout.contains(&a.0) && loadout.contains(&b.0))
+    }
+}
+
+impl ColocationSet {
+    /// Co-resident loadouts implied by this set's `models` DSL expression: each
+    /// returned group is a set of model ids that may be resident together. An
+    /// all-`&` expression yields one group; `|` branches yield one group per
+    /// alternative. A malformed expression yields no groups.
+    fn loadouts(&self) -> Vec<BTreeSet<String>> {
+        parse_colocation_expr(&self.models)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MatrixToken {
+    Ident(String),
+    And,
+    Or,
+    Open,
+    Close,
+}
+
+fn tokenize_colocation_expr(expr: &str) -> Vec<MatrixToken> {
+    let mut tokens = Vec::new();
+    let mut ident = String::new();
+    for ch in expr.chars() {
+        let operator = match ch {
+            '&' => Some(MatrixToken::And),
+            '|' => Some(MatrixToken::Or),
+            '(' => Some(MatrixToken::Open),
+            ')' => Some(MatrixToken::Close),
+            _ => None,
+        };
+        match operator {
+            Some(token) => {
+                if !ident.is_empty() {
+                    tokens.push(MatrixToken::Ident(std::mem::take(&mut ident)));
+                }
+                tokens.push(token);
+            }
+            None if ch.is_whitespace() => {
+                if !ident.is_empty() {
+                    tokens.push(MatrixToken::Ident(std::mem::take(&mut ident)));
+                }
+            }
+            None => ident.push(ch),
+        }
+    }
+    if !ident.is_empty() {
+        tokens.push(MatrixToken::Ident(ident));
+    }
+    tokens
+}
+
+/// Parses a matrix colocation DSL expression into its co-resident loadouts.
+/// Grammar: `expr := term ('|' term)*`, `term := factor ('&' factor)*`,
+/// `factor := IDENT | '(' expr ')'`. `&` unions loadouts (co-resident); `|`
+/// concatenates them (alternatives). Parsing is lenient: unbalanced or empty
+/// input yields no loadouts rather than erroring.
+fn parse_colocation_expr(expr: &str) -> Vec<BTreeSet<String>> {
+    let tokens = tokenize_colocation_expr(expr);
+    let mut pos = 0;
+    let loadouts = parse_or(&tokens, &mut pos);
+    dedup_loadouts(loadouts)
+}
+
+fn parse_or(tokens: &[MatrixToken], pos: &mut usize) -> Vec<BTreeSet<String>> {
+    let mut loadouts = parse_and(tokens, pos);
+    while matches!(tokens.get(*pos), Some(MatrixToken::Or)) {
+        *pos += 1;
+        loadouts.extend(parse_and(tokens, pos));
+    }
+    loadouts
+}
+
+fn parse_and(tokens: &[MatrixToken], pos: &mut usize) -> Vec<BTreeSet<String>> {
+    let mut loadouts = parse_factor(tokens, pos);
+    while matches!(tokens.get(*pos), Some(MatrixToken::And)) {
+        *pos += 1;
+        let rhs = parse_factor(tokens, pos);
+        loadouts = cross_union(&loadouts, &rhs);
+    }
+    loadouts
+}
+
+fn parse_factor(tokens: &[MatrixToken], pos: &mut usize) -> Vec<BTreeSet<String>> {
+    match tokens.get(*pos) {
+        Some(MatrixToken::Ident(id)) => {
+            *pos += 1;
+            vec![BTreeSet::from([id.clone()])]
+        }
+        Some(MatrixToken::Open) => {
+            *pos += 1;
+            let inner = parse_or(tokens, pos);
+            if matches!(tokens.get(*pos), Some(MatrixToken::Close)) {
+                *pos += 1;
+            }
+            inner
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Cross product of two loadout lists, unioning each pair (the `&` operator).
+/// An empty side means that operand had no parseable models; the other side is
+/// returned unchanged so a trailing or malformed operand cannot erase models.
+fn cross_union(lhs: &[BTreeSet<String>], rhs: &[BTreeSet<String>]) -> Vec<BTreeSet<String>> {
+    if lhs.is_empty() {
+        return rhs.to_vec();
+    }
+    if rhs.is_empty() {
+        return lhs.to_vec();
+    }
+    let mut out = Vec::new();
+    for left in lhs {
+        for right in rhs {
+            out.push(left.union(right).cloned().collect());
+        }
+    }
+    out
+}
+
+fn dedup_loadouts(loadouts: Vec<BTreeSet<String>>) -> Vec<BTreeSet<String>> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for loadout in loadouts {
+        if seen.insert(loadout.clone()) {
+            out.push(loadout);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Deserialize)]
 struct LlamaSwapModelsResponse {
     #[serde(default)]
@@ -474,6 +757,213 @@ struct LlamaSwapModelsResponse {
 #[derive(Debug, Deserialize)]
 struct LlamaSwapModel {
     id: String,
+}
+
+/// Process state of a model as reported over llama-swap's `/api/events` SSE
+/// stream. Mirrors the `state` field of each `modelStatus` entry; the lifecycle
+/// is `stopped` → `starting` → `ready` → `stopping` → `shutdown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlamaSwapModelState {
+    Stopped,
+    Starting,
+    Ready,
+    Stopping,
+    Shutdown,
+}
+
+impl LlamaSwapModelState {
+    fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "stopped" => Some(Self::Stopped),
+            "starting" => Some(Self::Starting),
+            "ready" => Some(Self::Ready),
+            "stopping" => Some(Self::Stopping),
+            "shutdown" => Some(Self::Shutdown),
+            _ => None,
+        }
+    }
+
+    /// Residency state to report for a model in this process state, or `None`
+    /// when the model is not loaded (stopped/shut down) and should be omitted
+    /// from a snapshot's resident list. `ready` is treated as hot on GPU;
+    /// `stopping` as draining.
+    pub fn residency(self) -> Option<ResidencyState> {
+        match self {
+            Self::Stopped | Self::Shutdown => None,
+            Self::Starting => Some(ResidencyState::Loading),
+            Self::Ready => Some(ResidencyState::HotGpu),
+            Self::Stopping => Some(ResidencyState::Draining),
+        }
+    }
+}
+
+/// Shared, push-updated map of model alias → llama-swap process state. Written
+/// by [`LlamaSwapEventStream`] on each SSE frame; read by
+/// [`LlamaSwapAdapter::inspect`].
+pub type ModelStateCache = Arc<RwLock<HashMap<String, LlamaSwapModelState>>>;
+
+#[derive(Debug, Deserialize)]
+struct ModelStatusFrame {
+    #[serde(rename = "type")]
+    kind: String,
+    /// llama-swap double-encodes the snapshot: `data` is a JSON *string*
+    /// containing the array of `{id, state}` entries, not a nested array.
+    data: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelStatusEntry {
+    id: String,
+    state: String,
+}
+
+/// Parses one SSE event's `data:` payload. Returns the model states carried by a
+/// `modelStatus` frame, or `None` for any other event type or malformed payload
+/// (heartbeats, comments, partial frames). Unknown `state` strings are dropped.
+fn parse_model_status_payload(payload: &str) -> Option<Vec<(String, LlamaSwapModelState)>> {
+    let frame: ModelStatusFrame = serde_json::from_str(payload).ok()?;
+    if frame.kind != "modelStatus" {
+        return None;
+    }
+    let entries: Vec<ModelStatusEntry> = serde_json::from_str(&frame.data).ok()?;
+    Some(
+        entries
+            .into_iter()
+            .filter_map(|entry| {
+                LlamaSwapModelState::from_wire(&entry.state).map(|state| (entry.id, state))
+            })
+            .collect(),
+    )
+}
+
+/// Incremental decoder for an SSE byte stream. Accumulates bytes across chunk
+/// boundaries, splits on blank-line event delimiters, and yields the parsed
+/// `modelStatus` updates from each complete event. Carriage returns are stripped
+/// so `\r\n\r\n` and `\n\n` delimiters are handled alike.
+#[derive(Default)]
+struct SseDecoder {
+    buffer: Vec<u8>,
+}
+
+impl SseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Vec<Vec<(String, LlamaSwapModelState)>> {
+        self.buffer
+            .extend(chunk.iter().copied().filter(|&b| b != b'\r'));
+        let mut updates = Vec::new();
+        while let Some(end) = find_subslice(&self.buffer, b"\n\n") {
+            let event: Vec<u8> = self.buffer.drain(..end + 2).collect();
+            if let Ok(text) = std::str::from_utf8(&event[..end]) {
+                if let Some(payload) = sse_data_field(text) {
+                    if let Some(update) = parse_model_status_payload(&payload) {
+                        updates.push(update);
+                    }
+                }
+            }
+        }
+        updates
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Joins the `data:` lines of one SSE event into a single payload, per the SSE
+/// spec (multiple `data:` lines concatenate with newlines). Returns `None` when
+/// the event has no data lines.
+fn sse_data_field(event: &str) -> Option<String> {
+    let mut data_lines = Vec::new();
+    for line in event.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    (!data_lines.is_empty()).then(|| data_lines.join("\n"))
+}
+
+/// Replaces the cache with a full `modelStatus` snapshot. llama-swap pushes the
+/// complete model set on every change, so this is replace, not merge.
+fn apply_model_status(cache: &ModelStateCache, entries: Vec<(String, LlamaSwapModelState)>) {
+    let mut guard = cache.write().unwrap_or_else(PoisonError::into_inner);
+    *guard = entries.into_iter().collect();
+}
+
+/// Builds snapshot residents from a model-state cache, omitting models that are
+/// not loaded (stopped/shut down). Sorted by model id for deterministic output
+/// so reconciliation diffs are stable.
+fn residents_from_states(states: &HashMap<String, LlamaSwapModelState>) -> Vec<ModelResident> {
+    let mut residents: Vec<ModelResident> = states
+        .iter()
+        .filter_map(|(name, state)| {
+            state.residency().map(|residency| ModelResident {
+                model_id: normalize_model_id(name),
+                state: residency,
+                vram_mb: None,
+                ram_mb: None,
+                kv_cache_mb: None,
+                loaded_since: None,
+            })
+        })
+        .collect();
+    residents.sort_by(|a, b| a.model_id.0.cmp(&b.model_id.0));
+    residents
+}
+
+/// Background subscriber to llama-swap's `/api/events` SSE stream. Maintains a
+/// [`ModelStateCache`] without polling, reconnecting on disconnect. The spawned
+/// task is aborted when this handle is dropped.
+pub struct LlamaSwapEventStream {
+    cache: ModelStateCache,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl LlamaSwapEventStream {
+    /// Read handle to the cache this stream maintains.
+    pub fn cache(&self) -> ModelStateCache {
+        Arc::clone(&self.cache)
+    }
+}
+
+impl Drop for LlamaSwapEventStream {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+const EVENT_STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(3);
+
+async fn run_event_stream(url: Url, auth_token: Option<String>, cache: ModelStateCache) {
+    let client = reqwest::Client::new();
+    loop {
+        if let Err(error) = stream_events_once(&client, &url, auth_token.as_deref(), &cache).await {
+            tracing::debug!(%url, %error, "llama-swap event stream disconnected; reconnecting");
+        }
+        tokio::time::sleep(EVENT_STREAM_RECONNECT_DELAY).await;
+    }
+}
+
+async fn stream_events_once(
+    client: &reqwest::Client,
+    url: &Url,
+    auth_token: Option<&str>,
+    cache: &ModelStateCache,
+) -> Result<(), RuntimeError> {
+    let mut request = client.get(url.clone());
+    if let Some(token) = auth_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?.error_for_status()?;
+    let mut stream = response.bytes_stream();
+    let mut decoder = SseDecoder::default();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        for update in decoder.push(&chunk) {
+            apply_model_status(cache, update);
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -506,14 +996,22 @@ impl RuntimeAdapter for LlamaSwapAdapter {
         }
 
         let configured_models = self.inspect_models().await?;
+        let residents = {
+            let states = self
+                .model_states
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            residents_from_states(&states)
+        };
 
         Ok(RuntimeSnapshot {
             runtime_id: self.id.clone(),
             available: true,
-            // /v1/models proves configuration, not residency — see
-            // docs/live_validation/residency-truth-contract.md. residents stays
-            // empty until we have evidence the model is loaded.
-            residents: Vec::new(),
+            // Residents come from the push-updated `/api/events` SSE cache — the
+            // only residency evidence we trust. `/v1/models` proves
+            // configuration, not load state; see
+            // docs/live_validation/residency-truth-contract.md.
+            residents,
             configured_models,
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
@@ -1165,6 +1663,179 @@ mod tests {
         );
     }
 
+    #[test]
+    fn llama_swap_model_state_maps_wire_strings() {
+        assert_eq!(
+            LlamaSwapModelState::from_wire("stopped"),
+            Some(LlamaSwapModelState::Stopped)
+        );
+        assert_eq!(
+            LlamaSwapModelState::from_wire("starting"),
+            Some(LlamaSwapModelState::Starting)
+        );
+        assert_eq!(
+            LlamaSwapModelState::from_wire("ready"),
+            Some(LlamaSwapModelState::Ready)
+        );
+        assert_eq!(
+            LlamaSwapModelState::from_wire("stopping"),
+            Some(LlamaSwapModelState::Stopping)
+        );
+        assert_eq!(
+            LlamaSwapModelState::from_wire("shutdown"),
+            Some(LlamaSwapModelState::Shutdown)
+        );
+        assert_eq!(LlamaSwapModelState::from_wire("bogus"), None);
+    }
+
+    #[test]
+    fn llama_swap_model_state_residency_omits_unloaded() {
+        assert_eq!(LlamaSwapModelState::Stopped.residency(), None);
+        assert_eq!(LlamaSwapModelState::Shutdown.residency(), None);
+        assert_eq!(
+            LlamaSwapModelState::Starting.residency(),
+            Some(ResidencyState::Loading)
+        );
+        assert_eq!(
+            LlamaSwapModelState::Ready.residency(),
+            Some(ResidencyState::HotGpu)
+        );
+        assert_eq!(
+            LlamaSwapModelState::Stopping.residency(),
+            Some(ResidencyState::Draining)
+        );
+    }
+
+    #[test]
+    fn parse_model_status_payload_extracts_double_encoded_states() {
+        // Captured shape: `data` is a JSON-encoded *string* of the entries.
+        let payload = r#"{"type":"modelStatus","data":"[{\"id\":\"minimax\",\"state\":\"starting\"},{\"id\":\"gemma\",\"state\":\"ready\"}]"}"#;
+
+        let parsed = parse_model_status_payload(payload).expect("modelStatus frame");
+
+        assert_eq!(
+            parsed,
+            vec![
+                ("minimax".to_string(), LlamaSwapModelState::Starting),
+                ("gemma".to_string(), LlamaSwapModelState::Ready),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_model_status_payload_ignores_other_frame_types() {
+        let payload = r#"{"type":"logData","data":"some log line"}"#;
+        assert_eq!(parse_model_status_payload(payload), None);
+    }
+
+    #[test]
+    fn sse_decoder_emits_frame_only_once_complete() {
+        let event = format!(
+            "data: {}\n\n",
+            r#"{"type":"modelStatus","data":"[{\"id\":\"gemma\",\"state\":\"ready\"}]"}"#
+        );
+        let (head, tail) = event.split_at(20);
+        let mut decoder = SseDecoder::default();
+
+        assert!(
+            decoder.push(head.as_bytes()).is_empty(),
+            "a partial frame must not emit an update"
+        );
+        let updates = decoder.push(tail.as_bytes());
+
+        assert_eq!(
+            updates,
+            vec![vec![("gemma".to_string(), LlamaSwapModelState::Ready)]]
+        );
+    }
+
+    #[test]
+    fn sse_decoder_splits_multiple_events_in_one_chunk() {
+        let chunk = format!(
+            "data: {}\n\ndata: {}\n\n",
+            r#"{"type":"modelStatus","data":"[{\"id\":\"a\",\"state\":\"starting\"}]"}"#,
+            r#"{"type":"modelStatus","data":"[{\"id\":\"a\",\"state\":\"ready\"}]"}"#
+        );
+        let mut decoder = SseDecoder::default();
+
+        let updates = decoder.push(chunk.as_bytes());
+
+        assert_eq!(
+            updates,
+            vec![
+                vec![("a".to_string(), LlamaSwapModelState::Starting)],
+                vec![("a".to_string(), LlamaSwapModelState::Ready)],
+            ]
+        );
+    }
+
+    #[test]
+    fn residents_from_states_omits_unloaded_and_sorts() {
+        let mut states = HashMap::new();
+        states.insert("models/qwen9b.gguf".to_string(), LlamaSwapModelState::Ready);
+        states.insert("granite8b".to_string(), LlamaSwapModelState::Starting);
+        states.insert("minimax".to_string(), LlamaSwapModelState::Stopped);
+
+        let residents = residents_from_states(&states);
+
+        assert_eq!(residents.len(), 2, "stopped model must be omitted");
+        assert_eq!(residents[0].model_id, ModelId("granite8b".to_string()));
+        assert_eq!(residents[0].state, ResidencyState::Loading);
+        assert_eq!(residents[1].model_id, ModelId("qwen9b".to_string()));
+        assert_eq!(residents[1].state, ResidencyState::HotGpu);
+    }
+
+    #[test]
+    fn apply_model_status_replaces_previous_snapshot() {
+        let cache: ModelStateCache = Arc::new(RwLock::new(HashMap::new()));
+        apply_model_status(
+            &cache,
+            vec![("gemma".to_string(), LlamaSwapModelState::Ready)],
+        );
+        apply_model_status(
+            &cache,
+            vec![("qwen9b".to_string(), LlamaSwapModelState::Starting)],
+        );
+
+        let guard = cache.read().expect("cache");
+        assert_eq!(guard.len(), 1, "full snapshot replaces, not merges");
+        assert_eq!(guard.get("qwen9b"), Some(&LlamaSwapModelState::Starting));
+        assert!(guard.get("gemma").is_none());
+    }
+
+    #[tokio::test]
+    async fn llama_swap_inspect_reports_residents_from_event_cache() {
+        let server = spawn_fixture(vec![
+            http_response(200, "{}"),
+            http_response(200, r#"{"data":[{"id":"models/qwen9b.gguf"}]}"#),
+        ])
+        .await;
+        let adapter = LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), &server.base_url)
+            .expect("adapter");
+
+        // Simulate the SSE stream having observed a ready and a stopped model.
+        apply_model_status(
+            &adapter.model_states(),
+            vec![
+                ("qwen9b".to_string(), LlamaSwapModelState::Ready),
+                ("granite8b".to_string(), LlamaSwapModelState::Stopped),
+            ],
+        );
+
+        let snapshot = adapter.inspect().await.expect("snapshot");
+
+        assert_eq!(
+            snapshot.residents.len(),
+            1,
+            "only the ready model is resident"
+        );
+        assert_eq!(
+            snapshot.residents[0].model_id,
+            ModelId("qwen9b".to_string())
+        );
+        assert_eq!(snapshot.residents[0].state, ResidencyState::HotGpu);
+    }
+
     #[tokio::test]
     async fn failed_runtime_health_maps_to_unavailable_snapshot() {
         let server = spawn_fixture(vec![http_response(503, "Service Unavailable")]).await;
@@ -1623,5 +2294,206 @@ mod tests {
             "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    fn m(id: &str) -> ModelId {
+        ModelId::from(id)
+    }
+
+    #[test]
+    fn matrix_parses_vars_evict_costs_and_sets() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  vars:
+    gpu: 24576
+  evict_costs:
+    minimax: 90000
+    qwen9b: 1
+  sets:
+    - name: small_plus_medium
+      models: qwen9b & qwen35_a3b
+"#,
+        )
+        .expect("parse")
+        .expect("matrix block present");
+
+        assert_eq!(matrix.vars.get("gpu"), Some(&24_576));
+        assert_eq!(matrix.evict_costs.get("minimax"), Some(&90_000));
+        assert_eq!(matrix.evict_costs.get("qwen9b"), Some(&1));
+        assert_eq!(matrix.sets.len(), 1);
+        assert_eq!(matrix.sets[0].name, "small_plus_medium");
+        assert_eq!(matrix.sets[0].models, "qwen9b & qwen35_a3b");
+    }
+
+    #[test]
+    fn can_colocate_true_for_models_in_shared_and_set() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: pair
+      models: qwen9b & qwen35_a3b
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        assert!(matrix.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+        assert!(matrix.can_colocate(&m("qwen35_a3b"), &m("qwen9b")));
+    }
+
+    #[test]
+    fn can_colocate_false_for_models_not_in_any_set_together() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: pair
+      models: qwen9b & qwen35_a3b
+    - name: solo
+      models: minimax
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        // minimax runs alone — it shares no set with the colocating pair.
+        assert!(!matrix.can_colocate(&m("qwen9b"), &m("minimax")));
+        assert!(!matrix.can_colocate(&m("qwen35_a3b"), &m("minimax")));
+        // A model absent from every set never colocates.
+        assert!(!matrix.can_colocate(&m("qwen9b"), &m("gemma")));
+    }
+
+    #[test]
+    fn or_branches_are_alternatives_not_colocated() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: either
+      models: qwen9b | qwen35_a3b
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        assert!(!matrix.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+    }
+
+    #[test]
+    fn grouping_colocates_each_alternative_with_shared_factor() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: grouped
+      models: (qwen4b | qwen2b) & gemma_e2b
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        assert!(matrix.can_colocate(&m("qwen4b"), &m("gemma_e2b")));
+        assert!(matrix.can_colocate(&m("qwen2b"), &m("gemma_e2b")));
+        // The two alternatives never load together.
+        assert!(!matrix.can_colocate(&m("qwen4b"), &m("qwen2b")));
+    }
+
+    #[test]
+    fn full_llama_swap_config_ignores_unrelated_keys() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+healthCheckTimeout: 90
+models:
+  qwen9b-co:
+    cmd: llama-server -m qwen9b.gguf
+  minimax:
+    cmd: llama-server -m minimax.gguf
+groups:
+  default:
+    - qwen9b-co
+matrix:
+  sets:
+    - name: pair
+      models: qwen9b-co & qwen35_a3b-co
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        // Model ids carry the `-co` colocation suffix verbatim from the config.
+        assert!(matrix.can_colocate(&m("qwen9b-co"), &m("qwen35_a3b-co")));
+        assert!(!matrix.can_colocate(&m("qwen9b-co"), &m("minimax")));
+    }
+
+    #[test]
+    fn config_without_matrix_block_parses_to_none() {
+        let parsed = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+healthCheckTimeout: 90
+models:
+  qwen9b:
+    cmd: llama-server -m qwen9b.gguf
+"#,
+        )
+        .expect("parse");
+
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn invalid_yaml_is_a_config_error() {
+        let result = LlamaSwapMatrixConfig::from_yaml_str("matrix: [unterminated");
+
+        assert!(matches!(result, Err(RuntimeError::Config(_))));
+    }
+
+    #[test]
+    fn from_yaml_file_reads_matrix_block() {
+        let path = std::env::temp_dir().join(format!("anemoi-matrix-{}.yaml", Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            "matrix:\n  sets:\n    - name: pair\n      models: qwen9b & qwen35_a3b\n",
+        )
+        .expect("write fixture");
+
+        let matrix = LlamaSwapMatrixConfig::from_yaml_file(&path)
+            .expect("parse")
+            .expect("matrix");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(matrix.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+    }
+
+    #[test]
+    fn adapter_can_colocate_false_without_matrix() {
+        let adapter =
+            LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), "http://localhost:8080")
+                .expect("adapter");
+
+        assert!(adapter.matrix().is_none());
+        assert!(!adapter.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+    }
+
+    #[test]
+    fn adapter_can_colocate_uses_matrix() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: pair
+      models: qwen9b & qwen35_a3b
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+        let adapter =
+            LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), "http://localhost:8080")
+                .expect("adapter")
+                .with_matrix_config(matrix);
+
+        assert!(adapter.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+        assert!(!adapter.can_colocate(&m("qwen9b"), &m("minimax")));
     }
 }

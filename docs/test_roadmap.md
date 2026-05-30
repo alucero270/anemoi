@@ -67,10 +67,13 @@ hardening when the local toolchain has the `clippy` component installed.
 | 26 operator status surface | Status and CLI output show runtime health, residents, staging, policy, and unknown/stale state. | `anemoi-daemon`, `anemoi-cli` | Passing |
 | 27 durable event store | Optional SQLite history records decisions, snapshots, staging, action plans, and explanations. | `anemoi-telemetry`, `anemoi-daemon` | Passing |
 | 28 inference forwarding gateway | `POST /v1/chat/completions` maps model field to domain, runs decide, forwards to selected runtime, streams response. | `anemoi-daemon`, `anemoi-runtime`, `anemoi-core` | Passing |
+| 29 llama-swap residency events | Live `/api/events` SSE stream feeds observed model state into `inspect()` residents and drives staging completion without polling or false residency. | `anemoi-runtime`, `anemoi-daemon` | Passing |
 
 ## Current Focus
 
-Build prompts 00-28 are passing. Prompt 28 (inference forwarding gateway) makes Anemoi an OpenAI-compatible endpoint for opencode: `POST /v1/chat/completions` treats the `model` field as a governance domain, runs `decide`, records telemetry, rewrites `model` to the selected runtime model, and streams the runtime response back with `X-Anemoi-Decision-Id`, `X-Anemoi-Selected-Model`, and `X-Anemoi-Action` headers. Mock forwarding works without `ANEMOI_ENABLE_LIVE_EXECUTE=1`; non-mock forwarding requires it.
+Build prompts 00-29 are passing. Prompt 29 (issue #62) subscribes to llama-swap's `/api/events` SSE stream so `inspect()` reports residents from observed model state and staging intents complete on real readiness. Prompt 28 (inference forwarding gateway) makes Anemoi an OpenAI-compatible endpoint for opencode: `POST /v1/chat/completions` treats the `model` field as a governance domain, runs `decide`, records telemetry, rewrites `model` to the selected runtime model, and streams the runtime response back with `X-Anemoi-Decision-Id`, `X-Anemoi-Selected-Model`, and `X-Anemoi-Action` headers. Mock forwarding works without `ANEMOI_ENABLE_LIVE_EXECUTE=1`; non-mock forwarding requires it.
+
+Issue #12 (resident transition emission) is complete: the reconciliation loop now diffs resident sets each tick and records every state change to the `resident_events` table through the `DecisionLog` trait, with a non-anonymous evidence source naming the adapter and reconciliation round. The event store stays optional (default no-op trait method; only SQLite persists transitions).
 
 Prompt 01 passed with:
 
@@ -282,6 +285,29 @@ asserts the recorded value round-trips, rather than asserting `is_ok`. The
 `evidence_source`. `execution_events`/`policy_events` tables are deferred: no
 required test exercises them and they belong to later prompts (21-23).
 
+Issue #12 (resident transition emission) wired the reconciliation loop to the
+`resident_events` table:
+
+- `resident_transitions_detects_first_observation_change_and_skips_unchanged`
+  (`anemoi-daemon`)
+- `reconciliation_tick_records_resident_transition` (`anemoi-daemon`)
+
+Prompt 27 built the `resident_events` table but only its own test called
+`record_resident_event`; nothing emitted transitions from the running daemon.
+Issue #12 closes that gap: each reconciliation tick diffs the previous and
+current resident sets per runtime and records every state change through the
+`DecisionLog` trait via `record_resident_transition` (a default no-op so the
+event store stays optional — in-memory/JSONL logs ignore transitions, only
+SQLite persists them). First observations record a `cold` → observed
+transition carrying a note, since `ResidencyState` has no `unknown` variant and
+issue #12 forbids inventing one. Evidence source is never anonymous: it names
+the adapter and the reconciliation round (`"<adapter> reconciliation round
+<n>"`). Vanished residents are not recorded (their target state is
+unobserved). `reconciliation_tick_records_resident_transition` reopens the
+SQLite store and asserts the persisted row's `from_state`, `to_state`,
+`runtime_id`, null `decision_id`, note text, and evidence string, rather than
+asserting `is_ok`.
+
 Prompt 28 passed with:
 
 - `inference_gateway_maps_model_field_to_domain`
@@ -305,3 +331,56 @@ response back. Forwarding lives in `anemoi-runtime` (`forward_chat_completion`
 is gated behind `ANEMOI_ENABLE_LIVE_EXECUTE=1` (prompt 20); mock forwarding is
 always allowed for offline development. Runtime failures return an
 OpenAI-shaped structured error carrying the decision id.
+
+Prompt 29 (issue #62) passed with:
+
+- `llama_swap_model_state_maps_wire_strings`
+- `llama_swap_model_state_residency_omits_unloaded`
+- `parse_model_status_payload_extracts_double_encoded_states`
+- `parse_model_status_payload_ignores_other_frame_types`
+- `sse_decoder_emits_frame_only_once_complete`
+- `sse_decoder_splits_multiple_events_in_one_chunk`
+- `residents_from_states_omits_unloaded_and_sorts`
+- `apply_model_status_replaces_previous_snapshot`
+- `llama_swap_inspect_reports_residents_from_event_cache`
+- `reconcile_ready_completes_only_the_ready_models_intent` (`anemoi-daemon`)
+- `staging_tick_completes_intent_from_readiness_without_live_execute` (`anemoi-daemon`)
+
+llama-swap pushes a full `modelStatus` snapshot on `GET /api/events` whenever a
+process changes state. The frame's `data` field is a **double-encoded** JSON
+string (parse the outer object, then parse `data` as the entry array). The
+adapter subscribes once, decodes the SSE byte stream incrementally
+(`SseDecoder` splits on blank lines and tolerates frames spanning chunks), and
+**replaces** its `ModelStateCache` on every snapshot so the cache mirrors
+llama-swap exactly. `inspect()` derives residents from that observed cache
+only — never from `/v1/models` (which lists *available*, not *resident*,
+models), preserving the prompt 18 residency-truth contract: with no event seen,
+residents stay empty. Wire states map `starting → Loading`, `ready → HotGpu`,
+`stopping → Draining`; `stopped`/`shutdown` produce no resident. The stream
+runs on its own untimed `reqwest` client (the adapter's inspect client keeps
+its 5s timeout) and reconnects after a 3s delay on disconnect. The daemon holds
+the subscribers in an `Arc<Vec<LlamaSwapEventStream>>` whose final drop aborts
+the tasks. `StagingWorker::reconcile_ready` then completes a pending staging
+intent the moment its background model is observed `HotGpu`/`Serving`, so
+staging closes from real readiness rather than a mock execute.
+
+Issue #49 (staging live-execute gate) closed a bypass found in the prompt 20
+controlled-execution review of #37:
+
+- `execute_pending_skips_live_runtime_without_enable_flag` (`anemoi-daemon`)
+
+`StagingWorker::execute_pending` called `runtime.load_model` directly with no
+`ANEMOI_ENABLE_LIVE_EXECUTE` guard, so any caller passing a live adapter could
+mutate a real runtime even with the opt-in absent — the daemon's own
+`run_staging_tick` gated correctly but the lower-level worker method did not.
+The fix gates `execute_pending` exactly like the tick: load is permitted only
+when the adapter is a mock or `ANEMOI_ENABLE_LIVE_EXECUTE=1`. Because the method
+holds only a `&DynRuntimeAdapter` (no runtime config), mock-ness now comes from
+a new `RuntimeAdapter::is_mock()` trait method (default `false`, `true` only on
+`MockRuntimeAdapter`) rather than a config lookup. A gated intent is left
+`Pending` — *not* dead-ended — so the SSE-readiness path (`reconcile_ready`) can
+still complete it if the model becomes resident by other means, identical to how
+`run_staging_tick` leaves gated intents pending. The required test drives a
+non-mock spy adapter that counts `load_model` calls and asserts the count stays
+`0` (load was *not* called) and the intent stays `Pending`, rather than
+asserting `is_ok`.
