@@ -359,8 +359,10 @@ The fix gates `execute_pending` exactly like the tick: load is permitted only
 when the adapter is a mock or `ANEMOI_ENABLE_LIVE_EXECUTE=1`. Because the method
 holds only a `&DynRuntimeAdapter` (no runtime config), mock-ness now comes from
 a new `RuntimeAdapter::is_mock()` trait method (default `false`, `true` only on
-`MockRuntimeAdapter`) rather than a config lookup. A gated intent transitions
-`Pending → Blocked` with the reason recorded in `last_error`. The required test
-drives a non-mock spy adapter that counts `load_model` calls and asserts the
-count stays `0` (load was *not* called) and the intent is `Blocked` with the
-gate reason, rather than asserting `is_ok`.
+`MockRuntimeAdapter`) rather than a config lookup. A gated intent is left
+`Pending` — *not* dead-ended — so the SSE-readiness path (`reconcile_ready`) can
+still complete it if the model becomes resident by other means, identical to how
+`run_staging_tick` leaves gated intents pending. The required test drives a
+non-mock spy adapter that counts `load_model` calls and asserts the count stays
+`0` (load was *not* called) and the intent stays `Pending`, rather than
+asserting `is_ok`.

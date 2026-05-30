@@ -264,11 +264,6 @@ impl StagingIntent {
         self.state = StagingState::Failed;
         self.last_error = Some(error);
     }
-
-    pub fn mark_blocked(&mut self, reason: String) {
-        self.state = StagingState::Blocked;
-        self.last_error = Some(reason);
-    }
 }
 
 #[derive(Clone)]
@@ -313,33 +308,28 @@ impl StagingWorker {
                 StagingState::Pending => intent.mark_pending(),
                 StagingState::Completed => intent.mark_completed(),
                 StagingState::Failed => intent.mark_failed(error.unwrap_or_default()),
-                StagingState::Blocked => intent.mark_blocked(error.unwrap_or_default()),
+                StagingState::Blocked => {
+                    intent.state = StagingState::Blocked;
+                }
             }
         }
     }
 
     pub async fn execute_pending(&self, runtime: &DynRuntimeAdapter) -> anyhow::Result<()> {
         // Loading a model mutates a real runtime, so it is gated exactly like the
-        // daemon's reconciliation tick: permitted only when the adapter is a mock
-        // or `ANEMOI_ENABLE_LIVE_EXECUTE=1` is set. Unlike `run_staging_tick` we
-        // only hold the adapter here, not the runtime config, so mock-ness is read
-        // from the adapter itself via `is_mock()` rather than `runtime_adapter_type`.
-        let live_allowed = runtime.is_mock() || live_execution_enabled();
+        // daemon's reconciliation tick (`run_staging_tick`): a load may fire only
+        // for a mock adapter or when `ANEMOI_ENABLE_LIVE_EXECUTE=1` is set. With
+        // the gate closed the pending intents are left untouched — still
+        // `Pending`, so the SSE-readiness path (`reconcile_ready`) can still
+        // complete them if the model becomes resident by other means — rather
+        // than dead-ended. Mock-ness comes from the adapter itself (`is_mock()`)
+        // because this method holds only the adapter, not the runtime config that
+        // `run_staging_tick` consults via `runtime_adapter_type`.
+        if !runtime.is_mock() && !live_execution_enabled() {
+            return Ok(());
+        }
         let pending = self.get_pending().await;
         for intent in pending {
-            if !live_allowed {
-                self.update_state(
-                    intent.id,
-                    StagingState::Blocked,
-                    Some(format!(
-                        "live-execute gate closed: runtime '{}' is not a mock and \
-                         ANEMOI_ENABLE_LIVE_EXECUTE is not set",
-                        runtime.id()
-                    )),
-                )
-                .await;
-                continue;
-            }
             match runtime.load_model(&intent.background_model).await {
                 Ok(_) => {
                     self.update_state(intent.id, StagingState::Completed, None)
@@ -2142,17 +2132,9 @@ mod tests {
             .expect("intent should still be queued");
         assert_eq!(
             intent.state,
-            StagingState::Blocked,
-            "a gated intent must transition Pending -> Blocked"
-        );
-        assert!(
-            intent
-                .last_error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("live-execute gate closed"),
-            "blocked intent must record why it was held: {:?}",
-            intent.last_error
+            StagingState::Pending,
+            "a gated intent must stay Pending (not dead-ended) so the readiness \
+             path can still complete it — matching run_staging_tick"
         );
     }
 
