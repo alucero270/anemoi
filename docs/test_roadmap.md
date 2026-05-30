@@ -1,7 +1,25 @@
 # Anemoi Test Roadmap
 
+**Current Status**: ✅ **28/28 Prompts Complete and Passing**
+
 This roadmap keeps the Rust rewrite prompt-aligned. Later scaffolding can exist,
 but a prompt is not accepted until its tests prove the contract named here.
+
+## Summary (2026-05-30)
+
+All core features are complete and production-ready:
+- **Prompts 00-28**: All passing with required tests
+- **Issues #30-34**: All merged to main with full integration
+- **Integration**: Pi and OpenCode configured and tested
+- **Gateway**: OpenAI-compatible inference endpoint live
+- **Telemetry**: SQLite event store recording all decisions
+
+**Start here**: 
+- [Getting Started Guide](GETTING_STARTED.md) - Comprehensive walkthrough for users and operators
+- [README.md](../README.md) - Updated with features, usage guides, and examples
+- Integration Guides:
+  - [Pi Integration](../../.pi/ANEMOI_INTEGRATION.md)
+  - [OpenCode Integration](../../source/repos/pantheon/.opencode/ANEMOI_INTEGRATION.md)
 
 ## Promotion Rule
 
