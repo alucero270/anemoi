@@ -111,6 +111,7 @@ async fn run(args: Args) -> anyhow::Result<String> {
                 max_output_tokens: None,
                 latency_budget_ms,
                 quality_floor: None,
+                escalation_intent: None,
             };
             let decision = state.decide(&request).await?;
             output.push_str(&format_decision(&decision));
@@ -427,6 +428,7 @@ mod tests {
             max_output_tokens: None,
             latency_budget_ms: Some(1500),
             quality_floor: None,
+            escalation_intent: None,
         };
 
         let decision = state.decide(&request).await.expect("decision");

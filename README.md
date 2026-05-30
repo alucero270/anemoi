@@ -207,11 +207,13 @@ Header: X-Anemoi-Selected-Model: qwen3.6-35b-a3b-mtp
 
 ### For OpenCode Users
 
-Same flow as Pi:
-1. **Select Model**: `"Anemoi Governed Coding (dynamic model selection)"`
-2. **Send Request**: Your code request
-3. **Anemoi Decides**: Best model for your code task
+**Note**: OpenCode configuration differs from Pi. For Anemoi integration:
+1. **Use Direct API**: Call the anemoi gateway directly at `https://anemoi.home.arpa/v1`
+2. **Or via Plugin**: Configure through your OpenCode plugin settings
+3. **API Endpoint**: POST to `/v1/chat/completions` with `model: "coding"`
 4. **Check Headers**: `X-Anemoi-Selected-Model` shows which model was selected
+
+See `source/repos/pantheon/.opencode/ANEMOI_INTEGRATION.md` for detailed configuration.
 
 ### For Direct API Calls
 

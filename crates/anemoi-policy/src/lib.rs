@@ -22,6 +22,8 @@ pub enum PolicyError {
     UnknownDomain(DomainId),
     #[error("domain {0} has no configured roster")]
     EmptyRoster(DomainId),
+    #[error("domain {0} live_roster references unknown runtime {1}")]
+    LiveRosterRuntimeMissing(DomainId, RuntimeId),
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +120,58 @@ impl Scheduler {
             .get(&request.domain)
             .ok_or_else(|| PolicyError::UnknownDomain(request.domain.clone()))?;
 
+        // Live roster: use the runtime's configured_models snapshot directly.
+        // Model profiles are synthesised from model IDs — no static config needed.
+        if let Some(live_runtime_id) = &domain.live_roster {
+            let Some(snapshot) = snapshots
+                .iter()
+                .find(|s| &s.runtime_id == live_runtime_id)
+            else {
+                return Err(PolicyError::LiveRosterRuntimeMissing(
+                    request.domain.clone(),
+                    live_runtime_id.clone(),
+                ));
+            };
+
+            if !snapshot.available {
+                return Ok(CandidateSet {
+                    candidates: Vec::new(),
+                    rejected_options: vec![RejectedOption {
+                        model_id: None,
+                        runtime_id: Some(live_runtime_id.clone()),
+                        reason: format!(
+                            "live_roster runtime {} is not available",
+                            live_runtime_id
+                        ),
+                    }],
+                });
+            }
+
+            let live_group = ResidencyGroup {
+                id: ResidencyGroupId("live".to_string()),
+                purpose: Vec::new(),
+                models: snapshot.configured_models.clone(),
+                keep_hot: false,
+                allow_background_load: true,
+                pinned: false,
+            };
+
+            let candidates = snapshot
+                .configured_models
+                .iter()
+                .map(|model_id| {
+                    let profile = synthesize_profile(model_id, live_runtime_id);
+                    generate_candidate(&live_group, &profile, live_runtime_id, snapshot)
+                })
+                .collect();
+
+            return Ok(CandidateSet {
+                candidates,
+                rejected_options: Vec::new(),
+            });
+        }
+
+        // Static roster path.
         if domain.rosters.is_empty() {
             return Err(PolicyError::EmptyRoster(request.domain.clone()));
         }
@@ -254,6 +308,61 @@ impl ScoredCandidate {
             created_at: Utc::now(),
         }
     }
+}
+
+/// Build a synthetic `ModelProfile` from a model ID reported by a live runtime.
+///
+/// Family is the leading alphabetic prefix of the ID (e.g. `qwen`, `gemma`,
+/// `minimax`).  Parameter class is extracted from the first `NNb` token found
+/// in the ID (e.g. `9b`, `35b`, `122b`); models whose IDs carry no such token
+/// (e.g. `minimax-256k`, `nemotron-udiq4-256k`) get `"unknown"` and will score
+/// low on quality but are still selectable when hot.
+fn synthesize_profile(model_id: &ModelId, runtime_id: &RuntimeId) -> ModelProfile {
+    let family: String = model_id
+        .0
+        .chars()
+        .take_while(|c| c.is_alphabetic())
+        .collect();
+
+    let parameter_class = extract_parameter_class(&model_id.0);
+
+    ModelProfile {
+        id: model_id.clone(),
+        family: if family.is_empty() {
+            "unknown".to_string()
+        } else {
+            family
+        },
+        parameter_class,
+        context_window: None,
+        vram_required_mb: None,
+        ram_required_mb: None,
+        cold_load_estimate_ms: None,
+        supports_streaming: Some(true),
+        supported_runtimes: vec![runtime_id.clone()],
+    }
+}
+
+/// Scan `id` for the first `NNb` token (one or more ASCII digits immediately
+/// followed by the letter `b`) and return it, e.g. `"35b"`.  Returns
+/// `"unknown"` when no such token is found.
+fn extract_parameter_class(id: &str) -> String {
+    let bytes = id.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'b' || bytes[i] == b'B') {
+                return format!("{}b", &id[start..i]);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    "unknown".to_string()
 }
 
 fn generate_candidate(
@@ -662,6 +771,7 @@ continuity:
             max_output_tokens: Some(800),
             latency_budget_ms: Some(1500),
             quality_floor: None,
+            escalation_intent: None,
         };
         let snapshot = RuntimeSnapshot {
             runtime_id: RuntimeId("ollama".to_string()),
@@ -1203,6 +1313,7 @@ continuity:
             max_output_tokens: Some(500),
             latency_budget_ms: Some(1500),
             quality_floor: None,
+            escalation_intent: None,
         }
     }
 
@@ -1270,5 +1381,229 @@ runtimes:
 "#,
         )
         .expect("candidate config")
+    }
+
+    // ── live roster tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn extract_parameter_class_parses_common_model_ids() {
+        let cases = [
+            ("qwen3.5-9b-mtp", "9b"),
+            ("qwen3.6-35b-a3b-mtp", "35b"),
+            ("qwen3.5-122b-a10b-mtp", "122b"),
+            ("qwen3.5-2b-mtp", "2b"),
+            ("qwen3.5-4b-mtp", "4b"),
+            ("qwen3.6-27b-mtp", "27b"),
+            ("gemma-4-26b-a4b-it-mtp", "26b"),
+            ("gemma-4-31b-it", "31b"),
+            ("gemma-4-e2b-it", "2b"),
+            ("gemma-4-e4b-it", "4b"),
+            ("granite-4.1-8b-gpu", "8b"),
+        ];
+        for (id, expected) in cases {
+            assert_eq!(
+                extract_parameter_class(id),
+                expected,
+                "failed for {}",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn extract_parameter_class_returns_unknown_for_non_parametric_ids() {
+        let cases = ["minimax-256k", "nemotron-udiq4-256k", "minimax-256k-iq3s"];
+        for id in cases {
+            assert_eq!(
+                extract_parameter_class(id),
+                "unknown",
+                "expected unknown for {}",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn live_roster_generates_candidates_from_configured_models() {
+        let config: AnemoiConfig = serde_yaml::from_str(
+            r#"
+domains:
+  coding:
+    live_roster: llama_swap
+runtimes:
+  llama_swap:
+    adapter: mock
+continuity:
+  keep_small_worker_hot: false
+  background_load: false
+  max_blank_wait_ms: 5000
+  prefer_degraded_response_over_silence: false
+"#,
+        )
+        .expect("config");
+
+        let scheduler = Scheduler::new(config);
+        let snapshot = RuntimeSnapshot {
+            runtime_id: RuntimeId("llama_swap".to_string()),
+            available: true,
+            residents: Vec::new(),
+            configured_models: vec![
+                ModelId("qwen3.5-9b-mtp".to_string()),
+                ModelId("qwen3.6-35b-a3b-mtp".to_string()),
+            ],
+            memory: RuntimeMemorySnapshot::default(),
+            active_requests: Vec::new(),
+        };
+
+        let request = InferenceRequest {
+            id: RequestId::new(),
+            domain: DomainId("coding".to_string()),
+            mode: ExecutionMode::Interactive,
+            prompt_tokens_estimate: None,
+            max_output_tokens: None,
+            latency_budget_ms: None,
+            quality_floor: None,
+            escalation_intent: None,
+        };
+
+        let set = scheduler
+            .generate_candidates(&request, &[snapshot])
+            .expect("candidates");
+
+        assert_eq!(set.candidates.len(), 2);
+        assert!(set.rejected_options.is_empty());
+        assert_eq!(
+            set.candidates
+                .iter()
+                .map(|c| c.model_id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["qwen3.5-9b-mtp", "qwen3.6-35b-a3b-mtp"]
+        );
+        // group id is "live" for synthesised candidates
+        assert!(set
+            .candidates
+            .iter()
+            .all(|c| c.group_id == ResidencyGroupId("live".to_string())));
+    }
+
+    #[test]
+    fn live_roster_synthesises_correct_family_and_parameter_class() {
+        let config: AnemoiConfig = serde_yaml::from_str(
+            r#"
+domains:
+  coding:
+    live_roster: llama_swap
+runtimes:
+  llama_swap:
+    adapter: mock
+"#,
+        )
+        .expect("config");
+
+        let scheduler = Scheduler::new(config);
+        let snapshot = RuntimeSnapshot {
+            runtime_id: RuntimeId("llama_swap".to_string()),
+            available: true,
+            residents: Vec::new(),
+            configured_models: vec![ModelId("qwen3.6-35b-a3b-mtp".to_string())],
+            memory: RuntimeMemorySnapshot::default(),
+            active_requests: Vec::new(),
+        };
+
+        let request = InferenceRequest {
+            id: RequestId::new(),
+            domain: DomainId("coding".to_string()),
+            mode: ExecutionMode::Interactive,
+            prompt_tokens_estimate: None,
+            max_output_tokens: None,
+            latency_budget_ms: None,
+            quality_floor: None,
+            escalation_intent: None,
+        };
+
+        let set = scheduler
+            .generate_candidates(&request, &[snapshot])
+            .expect("candidates");
+
+        let candidate = &set.candidates[0];
+        assert_eq!(candidate.model_profile.family, "qwen");
+        assert_eq!(candidate.model_profile.parameter_class, "35b");
+    }
+
+    #[test]
+    fn live_roster_returns_empty_candidates_when_runtime_unavailable() {
+        let config: AnemoiConfig = serde_yaml::from_str(
+            r#"
+domains:
+  coding:
+    live_roster: llama_swap
+runtimes:
+  llama_swap:
+    adapter: mock
+"#,
+        )
+        .expect("config");
+
+        let scheduler = Scheduler::new(config);
+        let snapshot = RuntimeSnapshot {
+            runtime_id: RuntimeId("llama_swap".to_string()),
+            available: false,
+            residents: Vec::new(),
+            configured_models: vec![ModelId("qwen3.5-9b-mtp".to_string())],
+            memory: RuntimeMemorySnapshot::default(),
+            active_requests: Vec::new(),
+        };
+
+        let request = InferenceRequest {
+            id: RequestId::new(),
+            domain: DomainId("coding".to_string()),
+            mode: ExecutionMode::Interactive,
+            prompt_tokens_estimate: None,
+            max_output_tokens: None,
+            latency_budget_ms: None,
+            quality_floor: None,
+            escalation_intent: None,
+        };
+
+        let set = scheduler
+            .generate_candidates(&request, &[snapshot])
+            .expect("candidates");
+
+        assert!(set.candidates.is_empty());
+        assert_eq!(set.rejected_options.len(), 1);
+        assert!(set.rejected_options[0].reason.contains("not available"));
+    }
+
+    #[test]
+    fn live_roster_error_when_runtime_snapshot_absent() {
+        let config: AnemoiConfig = serde_yaml::from_str(
+            r#"
+domains:
+  coding:
+    live_roster: llama_swap
+runtimes:
+  llama_swap:
+    adapter: mock
+"#,
+        )
+        .expect("config");
+
+        let scheduler = Scheduler::new(config);
+        let request = InferenceRequest {
+            id: RequestId::new(),
+            domain: DomainId("coding".to_string()),
+            mode: ExecutionMode::Interactive,
+            prompt_tokens_estimate: None,
+            max_output_tokens: None,
+            latency_budget_ms: None,
+            quality_floor: None,
+            escalation_intent: None,
+        };
+
+        let err = scheduler
+            .generate_candidates(&request, &[])
+            .expect_err("should error when runtime has no snapshot");
+
+        assert!(matches!(err, PolicyError::LiveRosterRuntimeMissing(_, _)));
     }
 }

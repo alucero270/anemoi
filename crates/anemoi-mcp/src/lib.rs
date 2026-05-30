@@ -194,6 +194,7 @@ mod tests {
             max_output_tokens: Some(500),
             latency_budget_ms: Some(1500),
             quality_floor: None,
+            escalation_intent: None,
         }
     }
 

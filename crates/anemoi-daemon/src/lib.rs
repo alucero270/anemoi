@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -229,6 +229,18 @@ pub struct StagingIntent {
     pub created_at: DateTime<Utc>,
     pub state: StagingState,
     pub last_error: Option<String>,
+    /// Context payload declared via `escalation_intent` at decision time, held
+    /// until the foreground model is evicted. On the eviction signal it is
+    /// written to the [`EscalationContextCache`], `context_ref` is set, and this
+    /// is cleared. Skipped in serialized output — the payload is local only and
+    /// `context_ref` is what consumers read (issue #64).
+    #[serde(skip)]
+    pub pending_context: Option<String>,
+    /// Reference to the stored context payload, set once the context has been
+    /// committed to the escalation cache on the eviction signal. `None` until
+    /// then, and when no context was declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_ref: Option<ContextRef>,
 }
 
 impl StagingIntent {
@@ -249,6 +261,8 @@ impl StagingIntent {
             created_at: Utc::now(),
             state: StagingState::Blocked,
             last_error: None,
+            pending_context: None,
+            context_ref: None,
         }
     }
 
@@ -369,6 +383,7 @@ impl StagingWorker {
         background_model: ModelId,
         target_runtime: RuntimeId,
         reason: String,
+        pending_context: Option<String>,
     ) {
         let mut intent = StagingIntent::new(
             decision_id,
@@ -377,14 +392,165 @@ impl StagingWorker {
             target_runtime,
             reason,
         );
+        intent.pending_context = pending_context;
         intent.mark_pending();
         self.enqueue(intent).await;
+    }
+
+    /// On the eviction signal (issue #64): for each `Pending` intent whose
+    /// foreground model is now draining, write its declared `pending_context` to
+    /// `cache` and record the resulting [`ContextRef`] on the intent. The
+    /// eviction window is the right moment to write — the foreground model is no
+    /// longer serving, so the snapshot is complete. Intents already committed, or
+    /// with no declared context, are skipped. Returns the committed intent ids.
+    pub async fn commit_eviction_context(
+        &self,
+        draining_models: &HashSet<ModelId>,
+        cache: &EscalationContextCache,
+    ) -> Vec<Uuid> {
+        let mut queue = self.queue.write().await;
+        let mut committed = Vec::new();
+        for intent in queue.iter_mut() {
+            if intent.context_ref.is_some() {
+                continue;
+            }
+            let foreground_draining = intent
+                .foreground_model
+                .as_ref()
+                .is_some_and(|model| draining_models.contains(model));
+            if !foreground_draining {
+                continue;
+            }
+            if let Some(payload) = intent.pending_context.take() {
+                intent.context_ref = Some(cache.write(intent.id, payload));
+                committed.push(intent.id);
+            }
+        }
+        committed
+    }
+
+    /// The [`ContextRef`] of a committed intent whose `background_model` is
+    /// `model`, clearing it from the intent so the context is handed off once.
+    /// Used by the escalation read path when the big model becomes the selected
+    /// model (issue #64). Returns `None` when no such staged context exists.
+    pub async fn take_context_ref_for_background(&self, model: &ModelId) -> Option<ContextRef> {
+        let mut queue = self.queue.write().await;
+        let intent = queue
+            .iter_mut()
+            .find(|i| &i.background_model == model && i.context_ref.is_some())?;
+        intent.context_ref.take()
     }
 }
 
 impl Default for StagingWorker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Reference into the [`EscalationContextCache`]. Wraps the staging-intent id the
+/// payload is keyed by, so a [`StagingIntent`] can point at its stored context
+/// without inlining the payload. Local-only — never transmitted off-machine
+/// (issue #64).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextRef(pub Uuid);
+
+/// Default time-to-live (seconds) for a cached escalation context before it is
+/// pruned, and the maximum number of entries retained. `chrono::Duration` is not
+/// const-constructible, so the TTL is stored as seconds and built in `Default`.
+const DEFAULT_ESCALATION_CONTEXT_TTL_SECS: i64 = 600;
+const DEFAULT_ESCALATION_CONTEXT_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone)]
+struct EscalationContextEntry {
+    payload: String,
+    stored_at: DateTime<Utc>,
+}
+
+/// Bounded, in-memory store of serialized escalation context payloads keyed by
+/// staging-intent id (issue #64). The agent declares context up front; on the
+/// eviction signal (foreground model draining) the payload is written here, then
+/// consumed by the execute/escalation path once the big model is ready.
+///
+/// Bounded two ways: each entry expires after `ttl`, and the store holds at most
+/// `capacity` entries (the oldest is dropped on overflow). Reads consume the
+/// entry, so a context is handed off at most once. The payload is local only —
+/// never persisted, never transmitted off-machine.
+#[derive(Clone)]
+pub struct EscalationContextCache {
+    entries: Arc<StdRwLock<HashMap<Uuid, EscalationContextEntry>>>,
+    ttl: chrono::Duration,
+    capacity: usize,
+}
+
+impl EscalationContextCache {
+    pub fn new(ttl: chrono::Duration, capacity: usize) -> Self {
+        Self {
+            entries: Arc::new(StdRwLock::new(HashMap::new())),
+            ttl,
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Writes `payload` for `intent_id`, returning the [`ContextRef`] consumers
+    /// use to retrieve it. Prunes expired entries and enforces the capacity cap
+    /// (evicting the oldest entry) before inserting.
+    pub fn write(&self, intent_id: Uuid, payload: String) -> ContextRef {
+        self.write_at(intent_id, payload, Utc::now())
+    }
+
+    fn write_at(&self, intent_id: Uuid, payload: String, now: DateTime<Utc>) -> ContextRef {
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+        entries.retain(|_, e| now.signed_duration_since(e.stored_at) < self.ttl);
+        // Evict oldest-first until there is room. Overwriting an existing id does
+        // not grow the map, so only evict when inserting a genuinely new key.
+        while entries.len() >= self.capacity && !entries.contains_key(&intent_id) {
+            let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, e)| e.stored_at)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            entries.remove(&oldest);
+        }
+        entries.insert(
+            intent_id,
+            EscalationContextEntry {
+                payload,
+                stored_at: now,
+            },
+        );
+        ContextRef(intent_id)
+    }
+
+    /// Consumes and returns the payload referenced by `context_ref`, or `None`
+    /// when it is absent or expired. Reads remove the entry (consume-on-read).
+    pub fn take(&self, context_ref: &ContextRef) -> Option<String> {
+        self.take_at(context_ref, Utc::now())
+    }
+
+    fn take_at(&self, context_ref: &ContextRef, now: DateTime<Utc>) -> Option<String> {
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+        let entry = entries.remove(&context_ref.0)?;
+        (now.signed_duration_since(entry.stored_at) < self.ttl).then_some(entry.payload)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
+impl Default for EscalationContextCache {
+    fn default() -> Self {
+        Self::new(
+            chrono::Duration::seconds(DEFAULT_ESCALATION_CONTEXT_TTL_SECS),
+            DEFAULT_ESCALATION_CONTEXT_CAPACITY,
+        )
     }
 }
 
@@ -481,6 +647,11 @@ pub struct AppState {
     decision_log: DynDecisionLog,
     reconciler: Reconciler,
     staging_worker: StagingWorker,
+    /// Store of escalation context payloads awaiting handoff to a background
+    /// model (issue #64). Written on the eviction signal, consumed by the
+    /// execute path when the big model is ready. Cloning `AppState` shares the
+    /// same store (it is `Arc`-backed internally).
+    escalation_context: EscalationContextCache,
     /// Live `/api/events` SSE subscribers for llama_swap runtimes. Held only to
     /// keep the background tasks alive for the process lifetime — the tasks are
     /// aborted when the last `AppState` clone drops. Shared via `Arc` so cloning
@@ -581,6 +752,7 @@ impl AppState {
             decision_log,
             reconciler,
             staging_worker,
+            escalation_context: EscalationContextCache::default(),
             event_streams: Arc::new(event_streams),
             reconciliation_round: Arc::new(AtomicU64::new(0)),
             live_execute: None,
@@ -652,6 +824,7 @@ impl AppState {
             decision_log: Arc::new(InMemoryDecisionLog::default()),
             reconciler,
             staging_worker,
+            escalation_context: EscalationContextCache::default(),
             event_streams: Arc::new(Vec::new()),
             reconciliation_round: Arc::new(AtomicU64::new(0)),
             live_execute: None,
@@ -823,6 +996,10 @@ impl AppState {
                 (&decision.selected_runtime, &decision.background_model)
             {
                 let reason = decision.explanation.summary.clone();
+                let pending_context = request
+                    .escalation_intent
+                    .as_ref()
+                    .and_then(|intent| intent.context.clone());
                 self.staging_worker
                     .unblock_and_queue(
                         decision.id,
@@ -830,6 +1007,7 @@ impl AppState {
                         model_id.clone(),
                         runtime_id.clone(),
                         reason,
+                        pending_context,
                     )
                     .await;
             }
@@ -1098,6 +1276,26 @@ impl AppState {
             .collect()
     }
 
+    /// Models the reconciliation cache reports as draining/evicting — i.e. in the
+    /// eviction window (llama-swap `stopping`, mapped to
+    /// [`ResidencyState::Draining`]). This is the signal to snapshot escalation
+    /// context before the foreground model stops serving (issue #64).
+    async fn draining_models(&self) -> HashSet<ModelId> {
+        self.reconciler
+            .get_snapshots()
+            .await
+            .into_iter()
+            .flat_map(|snapshot| snapshot.residents)
+            .filter(|resident| {
+                matches!(
+                    resident.state,
+                    ResidencyState::Draining | ResidencyState::Evicting
+                )
+            })
+            .map(|resident| resident.model_id)
+            .collect()
+    }
+
     /// Records resident transitions for one runtime into the durable event
     /// store (issue #12). Reconciliation is observation-only, so every
     /// transition is recorded with `decision_id = None`; the `evidence_source`
@@ -1138,6 +1336,17 @@ impl AppState {
     }
 
     pub async fn run_staging_tick(&self) {
+        // Eviction window (issue #64): a draining foreground model is no longer
+        // serving, so its staged context snapshot is complete — write it to the
+        // escalation cache before the model stops. In-memory only, so this runs
+        // regardless of the live-execute gate.
+        let draining_models = self.draining_models().await;
+        if !draining_models.is_empty() {
+            self.staging_worker
+                .commit_eviction_context(&draining_models, &self.escalation_context)
+                .await;
+        }
+
         // A staged model the readiness stream already reports as ready needs no
         // runtime call — complete those intents first (issue #62).
         let ready_models = self.ready_models().await;
@@ -1168,6 +1377,19 @@ impl AppState {
             }
         }
     }
+
+    /// Consumes any escalation context staged for `model` and returns it as the
+    /// initial-prompt payload for the big model's first inference call (issue
+    /// #64). Finds a committed staging intent whose `background_model` is `model`,
+    /// takes its `context_ref`, and consumes the payload from the cache. Returns
+    /// `None` when no context was staged for this model.
+    async fn take_escalation_context(&self, model: &ModelId) -> Option<String> {
+        let context_ref = self
+            .staging_worker
+            .take_context_ref_for_background(model)
+            .await?;
+        self.escalation_context.take(&context_ref)
+    }
 }
 
 fn live_execution_enabled() -> bool {
@@ -1178,8 +1400,8 @@ fn live_execution_enabled() -> bool {
 mod tests {
     use super::*;
     use anemoi_core::{
-        DecisionAction, DomainId, ExecutionMode, ModelId, ModelProfileConfig, ModelResident,
-        RequestId, ResidencyState, RuntimeConfig, RuntimeId,
+        DecisionAction, DomainId, EscalationIntent, ExecutionMode, ModelId, ModelProfileConfig,
+        ModelResident, RequestId, ResidencyState, RuntimeConfig, RuntimeId,
     };
     use anemoi_telemetry::{decision_log_from, DecisionLog, InMemoryDecisionLog, SqliteEventStore};
     use axum::body::{to_bytes, Body};
@@ -1593,6 +1815,7 @@ mod tests {
             max_output_tokens: None,
             latency_budget_ms: None,
             quality_floor: None,
+            escalation_intent: None,
         };
 
         let response = test_router()
@@ -1682,6 +1905,7 @@ mod tests {
             max_output_tokens: Some(500),
             latency_budget_ms: Some(1500),
             quality_floor: None,
+            escalation_intent: None,
         }
     }
 
@@ -2503,6 +2727,7 @@ runtimes:
                 ModelId("granite8b".to_string()),
                 RuntimeId("mock".to_string()),
                 "background staging test".to_string(),
+                None,
             )
             .await;
 
@@ -2610,6 +2835,7 @@ runtimes:
                 ModelId("granite8b".to_string()),
                 swap_rt,
                 "ready via SSE cache".to_string(),
+                None,
             )
             .await;
 
@@ -2639,6 +2865,7 @@ runtimes:
                 ModelId("granite8b".to_string()),
                 RuntimeId("nonexistent".to_string()),
                 "should be skipped".to_string(),
+                None,
             )
             .await;
 
@@ -2681,6 +2908,7 @@ runtimes:
                 ModelId("qwen9b".to_string()),
                 live_runtime_id,
                 "should be held behind live gate".to_string(),
+                None,
             )
             .await;
 
@@ -3033,6 +3261,211 @@ continuity:
             "structured error must carry the decision id"
         );
     }
+
+    #[test]
+    fn escalation_context_cache_roundtrips_then_consumes() {
+        let cache = EscalationContextCache::default();
+        let id = Uuid::new_v4();
+
+        let cref = cache.write(id, "prompt context".to_string());
+        assert_eq!(cref, ContextRef(id), "the ref is keyed by the staging-intent id");
+        assert_eq!(cache.take(&cref), Some("prompt context".to_string()));
+        assert_eq!(
+            cache.take(&cref),
+            None,
+            "a consumed context is handed off only once"
+        );
+    }
+
+    #[test]
+    fn escalation_context_cache_expires_after_ttl() {
+        let cache = EscalationContextCache::new(chrono::Duration::seconds(60), 16);
+        let id = Uuid::new_v4();
+        let stored = Utc::now();
+
+        cache.write_at(id, "context".to_string(), stored);
+        assert_eq!(
+            cache.take_at(&ContextRef(id), stored + chrono::Duration::seconds(30)),
+            Some("context".to_string()),
+            "an entry within its TTL is retrievable"
+        );
+
+        cache.write_at(id, "context".to_string(), stored);
+        assert_eq!(
+            cache.take_at(&ContextRef(id), stored + chrono::Duration::seconds(61)),
+            None,
+            "an entry past its TTL is not handed off"
+        );
+    }
+
+    #[test]
+    fn escalation_context_cache_evicts_oldest_over_capacity() {
+        let cache = EscalationContextCache::new(chrono::Duration::seconds(600), 2);
+        let base = Utc::now();
+        let oldest = Uuid::new_v4();
+        let middle = Uuid::new_v4();
+        let newest = Uuid::new_v4();
+
+        cache.write_at(oldest, "1".to_string(), base);
+        cache.write_at(middle, "2".to_string(), base + chrono::Duration::seconds(1));
+        cache.write_at(newest, "3".to_string(), base + chrono::Duration::seconds(2));
+
+        assert_eq!(cache.len(), 2, "the capacity cap holds the store at two entries");
+        assert_eq!(
+            cache.take(&ContextRef(oldest)),
+            None,
+            "the oldest entry is evicted first on overflow"
+        );
+        assert_eq!(cache.take(&ContextRef(middle)), Some("2".to_string()));
+        assert_eq!(cache.take(&ContextRef(newest)), Some("3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn commit_eviction_context_writes_when_foreground_drains() {
+        let worker = StagingWorker::new();
+        let cache = EscalationContextCache::default();
+        let small = ModelId("qwen9b".to_string());
+
+        worker
+            .unblock_and_queue(
+                Uuid::new_v4(),
+                Some(small.clone()),
+                ModelId("minimax".to_string()),
+                RuntimeId("swap_rt".to_string()),
+                "escalate to big model".to_string(),
+                Some("carry this prompt".to_string()),
+            )
+            .await;
+        // A second intent whose foreground is not draining must be left alone.
+        worker
+            .unblock_and_queue(
+                Uuid::new_v4(),
+                Some(ModelId("granite8b".to_string())),
+                ModelId("qwen35_a3b".to_string()),
+                RuntimeId("swap_rt".to_string()),
+                "unrelated staging".to_string(),
+                Some("should stay pending".to_string()),
+            )
+            .await;
+
+        let draining: HashSet<ModelId> = [small.clone()].into_iter().collect();
+        let committed = worker.commit_eviction_context(&draining, &cache).await;
+        assert_eq!(
+            committed.len(),
+            1,
+            "only the intent whose foreground is draining commits"
+        );
+
+        let all = worker.get_all().await;
+        let escalating = all
+            .iter()
+            .find(|i| i.foreground_model.as_ref() == Some(&small))
+            .expect("escalating intent");
+        let cref = escalating
+            .context_ref
+            .clone()
+            .expect("context_ref is set on the eviction signal");
+        assert!(
+            escalating.pending_context.is_none(),
+            "the pending context is moved into the cache, not left on the intent"
+        );
+        assert_eq!(cache.take(&cref), Some("carry this prompt".to_string()));
+
+        let untouched = all
+            .iter()
+            .find(|i| i.foreground_model.as_ref() == Some(&ModelId("granite8b".to_string())))
+            .expect("unrelated intent");
+        assert!(
+            untouched.context_ref.is_none(),
+            "an intent whose foreground is not draining keeps its pending context"
+        );
+        assert_eq!(untouched.pending_context.as_deref(), Some("should stay pending"));
+
+        let again = worker.commit_eviction_context(&draining, &cache).await;
+        assert!(
+            again.is_empty(),
+            "an already-committed intent does not commit again"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_attaches_escalation_context_to_staging_intent() {
+        let mut config = example_config();
+        config.continuity.background_load = true;
+        config.continuity.keep_small_worker_hot = true;
+        let state =
+            AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+
+        let mut request = sample_request();
+        request.escalation_intent = Some(EscalationIntent {
+            task_type: Some("planning".to_string()),
+            context: Some("multistep troubleshooting context".to_string()),
+        });
+
+        state.decide(&request).await.expect("decision");
+
+        let intents = state.staging_worker.get_all().await;
+        let staged = intents.first().expect("a staging intent was enqueued");
+        assert_eq!(
+            staged.pending_context.as_deref(),
+            Some("multistep troubleshooting context"),
+            "the declared escalation context rides along on the staging intent"
+        );
+        assert!(
+            staged.context_ref.is_none(),
+            "context_ref is set only on the eviction signal, not at decision time"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_hands_off_staged_escalation_context() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+        state.run_reconciliation_tick().await;
+
+        let decision = state.decide(&sample_request()).await.expect("decision");
+        let model = decision.selected_model.clone().expect("a selected model");
+        let runtime = decision.selected_runtime.clone().expect("a selected runtime");
+
+        // Simulate a prior escalation: a completed staging intent for the
+        // selected model carrying a committed context reference.
+        let mut intent = StagingIntent::new(
+            decision.id,
+            Some(model.clone()),
+            model.clone(),
+            runtime,
+            "prior escalation".to_string(),
+        );
+        intent.mark_completed();
+        let cref = state
+            .escalation_context
+            .write(intent.id, "prior small-model context".to_string());
+        intent.context_ref = Some(cref);
+        state.staging_worker.enqueue(intent).await;
+
+        let response = router(state.clone())
+            .oneshot(json_request("/execute", &sample_request()))
+            .await
+            .expect("response");
+        let execute: ExecuteResponse =
+            serde_json::from_value(json_body(response).await).expect("execute response");
+        assert_eq!(
+            execute.handoff.escalation_context.as_deref(),
+            Some("prior small-model context"),
+            "execute hands the staged context to the selected model as its initial prompt"
+        );
+
+        let again = router(state)
+            .oneshot(json_request("/execute", &sample_request()))
+            .await
+            .expect("response");
+        let again: ExecuteResponse =
+            serde_json::from_value(json_body(again).await).expect("execute response");
+        assert!(
+            again.handoff.escalation_context.is_none(),
+            "the context is handed off at most once"
+        );
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -3284,7 +3717,8 @@ pub fn openapi_document() -> serde_json::Value {
                         "prompt_tokens_estimate": { "type": "integer", "nullable": true },
                         "max_output_tokens": { "type": "integer", "nullable": true },
                         "latency_budget_ms": { "type": "integer", "nullable": true },
-                        "quality_floor": { "type": "object", "nullable": true }
+                        "quality_floor": { "type": "object", "nullable": true },
+                        "escalation_intent": { "type": "object", "nullable": true }
                     }
                 },
                 "RuntimeSnapshot": {
@@ -3337,6 +3771,7 @@ pub fn openapi_document() -> serde_json::Value {
                     "properties": {
                         "load_requested": { "type": "boolean" },
                         "full_inference_forwarded": { "type": "boolean", "enum": [false] },
+                        "escalation_context": { "type": "string", "nullable": true },
                         "message": { "type": "string" }
                     }
                 },
@@ -3383,6 +3818,14 @@ async fn execute(
 ) -> Result<Json<ExecuteResponse>, (StatusCode, String)> {
     let decision = state.decide(&request).await.map_err(internal_error)?;
 
+    // If the selected model is one a prior escalation staged context for, hand
+    // that context off now as its initial prompt, consuming it from the cache
+    // (issue #64). Safe regardless of the live-execute gate — it is a cache read.
+    let escalation_context = match &decision.selected_model {
+        Some(model) => state.take_escalation_context(model).await,
+        None => None,
+    };
+
     let dry_run = !live_execution_enabled();
     let action_plan = state.generate_action_plan(&decision, dry_run);
 
@@ -3418,6 +3861,7 @@ async fn execute(
         handoff: ExecuteHandoff {
             load_requested,
             full_inference_forwarded: false,
+            escalation_context,
             message: if dry_run {
                 "v1 execute performs dry-run action plan and model-load handoff only"
             } else {
@@ -3439,6 +3883,11 @@ pub struct ExecuteResponse {
 pub struct ExecuteHandoff {
     pub load_requested: bool,
     pub full_inference_forwarded: bool,
+    /// Escalation context (issue #64) consumed from the cache and supplied as the
+    /// selected model's initial prompt, when a staged handoff was pending for it.
+    /// `None` when there was no escalation context to hand off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_context: Option<String>,
     pub message: String,
 }
 
@@ -3602,6 +4051,7 @@ async fn chat_completions(
         max_output_tokens: None,
         latency_budget_ms: Some(DEFAULT_GATEWAY_LATENCY_BUDGET_MS),
         quality_floor: None,
+        escalation_intent: None,
     };
     let decision = match state.decide(&request).await {
         Ok(decision) => decision,
