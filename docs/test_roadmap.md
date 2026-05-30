@@ -49,10 +49,11 @@ hardening when the local toolchain has the `clippy` component installed.
 | 26 operator status surface | Status and CLI output show runtime health, residents, staging, policy, and unknown/stale state. | `anemoi-daemon`, `anemoi-cli` | Passing |
 | 27 durable event store | Optional SQLite history records decisions, snapshots, staging, action plans, and explanations. | `anemoi-telemetry`, `anemoi-daemon` | Passing |
 | 28 inference forwarding gateway | `POST /v1/chat/completions` maps model field to domain, runs decide, forwards to selected runtime, streams response. | `anemoi-daemon`, `anemoi-runtime`, `anemoi-core` | Passing |
+| 29 llama-swap residency events | Live `/api/events` SSE stream feeds observed model state into `inspect()` residents and drives staging completion without polling or false residency. | `anemoi-runtime`, `anemoi-daemon` | Passing |
 
 ## Current Focus
 
-Build prompts 00-28 are passing. Prompt 28 (inference forwarding gateway) makes Anemoi an OpenAI-compatible endpoint for opencode: `POST /v1/chat/completions` treats the `model` field as a governance domain, runs `decide`, records telemetry, rewrites `model` to the selected runtime model, and streams the runtime response back with `X-Anemoi-Decision-Id`, `X-Anemoi-Selected-Model`, and `X-Anemoi-Action` headers. Mock forwarding works without `ANEMOI_ENABLE_LIVE_EXECUTE=1`; non-mock forwarding requires it.
+Build prompts 00-29 are passing. Prompt 29 (issue #62) subscribes to llama-swap's `/api/events` SSE stream so `inspect()` reports residents from observed model state and staging intents complete on real readiness. Prompt 28 (inference forwarding gateway) makes Anemoi an OpenAI-compatible endpoint for opencode: `POST /v1/chat/completions` treats the `model` field as a governance domain, runs `decide`, records telemetry, rewrites `model` to the selected runtime model, and streams the runtime response back with `X-Anemoi-Decision-Id`, `X-Anemoi-Selected-Model`, and `X-Anemoi-Action` headers. Mock forwarding works without `ANEMOI_ENABLE_LIVE_EXECUTE=1`; non-mock forwarding requires it.
 
 Prompt 01 passed with:
 
@@ -287,3 +288,35 @@ response back. Forwarding lives in `anemoi-runtime` (`forward_chat_completion`
 is gated behind `ANEMOI_ENABLE_LIVE_EXECUTE=1` (prompt 20); mock forwarding is
 always allowed for offline development. Runtime failures return an
 OpenAI-shaped structured error carrying the decision id.
+
+Prompt 29 (issue #62) passed with:
+
+- `llama_swap_model_state_maps_wire_strings`
+- `llama_swap_model_state_residency_omits_unloaded`
+- `parse_model_status_payload_extracts_double_encoded_states`
+- `parse_model_status_payload_ignores_other_frame_types`
+- `sse_decoder_emits_frame_only_once_complete`
+- `sse_decoder_splits_multiple_events_in_one_chunk`
+- `residents_from_states_omits_unloaded_and_sorts`
+- `apply_model_status_replaces_previous_snapshot`
+- `llama_swap_inspect_reports_residents_from_event_cache`
+- `reconcile_ready_completes_only_the_ready_models_intent` (`anemoi-daemon`)
+- `staging_tick_completes_intent_from_readiness_without_live_execute` (`anemoi-daemon`)
+
+llama-swap pushes a full `modelStatus` snapshot on `GET /api/events` whenever a
+process changes state. The frame's `data` field is a **double-encoded** JSON
+string (parse the outer object, then parse `data` as the entry array). The
+adapter subscribes once, decodes the SSE byte stream incrementally
+(`SseDecoder` splits on blank lines and tolerates frames spanning chunks), and
+**replaces** its `ModelStateCache` on every snapshot so the cache mirrors
+llama-swap exactly. `inspect()` derives residents from that observed cache
+only — never from `/v1/models` (which lists *available*, not *resident*,
+models), preserving the prompt 18 residency-truth contract: with no event seen,
+residents stay empty. Wire states map `starting → Loading`, `ready → HotGpu`,
+`stopping → Draining`; `stopped`/`shutdown` produce no resident. The stream
+runs on its own untimed `reqwest` client (the adapter's inspect client keeps
+its 5s timeout) and reconnects after a 3s delay on disconnect. The daemon holds
+the subscribers in an `Arc<Vec<LlamaSwapEventStream>>` whose final drop aborts
+the tasks. `StagingWorker::reconcile_ready` then completes a pending staging
+intent the moment its background model is observed `HotGpu`/`Serving`, so
+staging closes from real readiness rather than a mock execute.
