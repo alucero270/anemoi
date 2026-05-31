@@ -619,10 +619,10 @@ pub fn validate_config(config: &AnemoiConfig) -> Vec<ConfigDiagnostic> {
     let mut domains = config.domains.iter().collect::<Vec<_>>();
     domains.sort_by_key(|(domain_id, _)| domain_id.to_string());
     for (domain_id, domain) in domains {
-        if domain.rosters.is_empty() {
+        if domain.rosters.is_empty() && domain.live_roster.is_none() {
             diagnostics.push(ConfigDiagnostic::error(
                 format!("domains.{domain_id}.rosters"),
-                "domain must reference at least one residency group",
+                "domain must reference at least one residency group or set live_roster",
             ));
         }
 
@@ -958,8 +958,32 @@ mod tests {
             diagnostics,
             vec![ConfigDiagnostic::error(
                 "domains.coding.rosters",
-                "domain must reference at least one residency group",
+                "domain must reference at least one residency group or set live_roster",
             )]
+        );
+    }
+
+    #[test]
+    fn accepts_domain_with_live_roster_and_no_static_rosters() {
+        let config: AnemoiConfig = serde_yaml::from_str(
+            r#"
+domains:
+  coding:
+    live_roster: llama_swap
+runtimes:
+  llama_swap:
+    adapter: llama_swap
+    base_url: "http://localhost:8085"
+    auth_token: "LOCAL"
+"#,
+        )
+        .expect("config");
+
+        let diagnostics = validate_config(&config);
+        assert!(
+            diagnostics.is_empty(),
+            "live_roster domain must pass validation without static rosters: {:?}",
+            diagnostics
         );
     }
 
