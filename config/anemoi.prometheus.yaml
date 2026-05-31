@@ -4,18 +4,47 @@
 #   export ANEMOI_LLAMA_SWAP_BASE_URL=http://172.17.0.1:8085
 #   export ANEMOI_LLAMA_SWAP_AUTH_TOKEN=LOCAL
 #   export ANEMOI_CONFIG=/home/alex/anemoi/config/anemoi.prometheus.yaml
-#   export ANEMOI_BIND=127.0.0.1:7070
+#   export ANEMOI_BIND=0.0.0.0:7070
 #
 # No secrets committed here.
 #
-# The coding domain uses a live roster: anemoi reads the model list directly
-# from llama-swap at runtime and synthesises candidate profiles on the fly.
-# No manual roster maintenance required — add or remove models in llama-swap
-# and anemoi picks them up automatically.
+# coding       — fast interactive models; Hermes/agent default.
+# coding-full  — full live llama-swap roster; used for escalation / manual override.
 
 domains:
   coding:
+    rosters:
+      - fast_coding
+  coding-full:
     live_roster: llama_swap
+
+residency_groups:
+  fast_coding:
+    purpose:
+      - coding
+      - interactive
+    models:
+      - qwen3.5-9b-mtp
+      - qwen3.5-4b-mtp
+    allow_background_load: true
+
+models:
+  qwen3.5-9b-mtp:
+    family: qwen
+    parameter_class: 9b
+    context_window: 262144
+    cold_load_estimate_ms: 45000
+    supported_runtimes:
+      - llama_swap
+    supports_streaming: true
+  qwen3.5-4b-mtp:
+    family: qwen
+    parameter_class: 4b
+    context_window: 262144
+    cold_load_estimate_ms: 20000
+    supported_runtimes:
+      - llama_swap
+    supports_streaming: true
 
 runtimes:
   llama_swap:
